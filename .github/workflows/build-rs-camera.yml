@@ -1,3 +1,30 @@
+name: Build RealSense Camera APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build RealSense Camera
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      # 1. Получаем исходный код Intel RealSense
+      - name: Checkout librealsense
+        uses: actions/checkout@v4
+        with:
+          repository: realsenseai/librealsense
+          ref: v2.59.1
+          path: source
+
+      # 2. Исправляем ошибку enum в Option.java
       - name: Fix Option.java enum syntax
         shell: bash
         run: |
@@ -8,15 +35,65 @@
               "source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java"
           )
 
+          if not file.exists():
+              raise SystemExit(f"File not found: {file}")
+
           content = file.read_text()
+
           old = "OPTION_SAFETY_MODE(96);"
           new = "OPTION_SAFETY_MODE(96),"
 
-          if content.count(old) != 1:
+          count = content.count(old)
+
+          if count != 1:
               raise SystemExit(
-                  f"Expected one occurrence of {old}, found {content.count(old)}"
+                  f"Expected exactly one occurrence of {old!r}, found {count}"
               )
 
           file.write_text(content.replace(old, new, 1))
+
           print("Option.java syntax fixed successfully")
           PY
+
+      # 3. Устанавливаем Java 17
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 4. Устанавливаем Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      # 5. Устанавливаем необходимые компоненты Android SDK
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+
+      # 6. Устанавливаем Gradle 8.11.1
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.11.1'
+
+      # 7. Собираем Android-приложение
+      - name: Build RealSense Camera
+        working-directory: source/wrappers/android
+        shell: bash
+        run: |
+          gradle :tools:camera:assembleDebug --no-daemon --stacktrace
+
+      # 8. Сохраняем собранный APK
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RS-Camera-Android
+          path: source/wrappers/android/tools/camera/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
