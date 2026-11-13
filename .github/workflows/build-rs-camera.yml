@@ -29,510 +29,1315 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
-python3 - <<'PY'
-from pathlib import Path
-from textwrap import dedent
+          from pathlib import Path
 
-app = Path("source/wrappers/android/tools/camera")
-java_dir = app / "src/main/java/com/intel/realsense/camera"
-rs_java = Path("source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense")
-activity_file = java_dir / "PreviewActivity.java"
-layout_file = app / "src/main/res/layout/activity_preview.xml"
-renderer_file = rs_java / "GLRenderer.java"
-points_view_file = rs_java / "GLPointsFrame.java"
-rs_surface_file = rs_java / "GLRsSurfaceView.java"
-exporter_file = java_dir / "PlySnapshotExporter.java"
-app_gradle_file = app / "build.gradle"
+          file = Path(
+              "source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java"
+          )
+          if not file.exists():
+              raise SystemExit(f"File not found: {file}")
 
-for required in (activity_file, layout_file, renderer_file, points_view_file, rs_surface_file, exporter_file, app_gradle_file):
-    if not required.exists():
-        raise SystemExit(f"Required source file not found: {required}")
+          content = file.read_text()
+          old = "OPTION_SAFETY_MODE(96);"
+          new = "OPTION_SAFETY_MODE(96),"
+          count = content.count(old)
+          if count != 1:
+              raise SystemExit(f"Expected one occurrence of {old!r}, found {count}")
 
-def replace_once(content: str, old: str, new: str, label: str) -> str:
-    count = content.count(old)
-    if count != 1:
-        raise SystemExit(f"Patch anchor {label!r}: expected exactly 1 match, found {count}")
-    return content.replace(old, new, 1)
+          file.write_text(content.replace(old, new, 1))
+          print("Option.java enum syntax fixed")
+          PY
 
-# 1) Add the on-device incremental ICP fusion engine.
-fusion_file = rs_java / "PointCloudFusion.java"
-if fusion_file.exists():
-    raise SystemExit(f"Refusing to overwrite unexpected file: {fusion_file}")
-fusion_file.write_text(dedent(r'''
-    package com.intel.realsense.librealsense;
+      # Add a PLY snapshot export button to the existing RS Camera preview.
+      # Retains single-frame PLY capture as a fallback when no fused scan exists.
+      - name: Add local PLY snapshot export
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent, indent
 
-    import java.io.BufferedWriter;
-    import java.io.File;
-    import java.io.FileWriter;
-    import java.io.IOException;
-    import java.util.HashMap;
-    import java.util.Locale;
-    import java.util.Map;
+          app = Path("source/wrappers/android/tools/camera")
+          java_dir = app / "src/main/java/com/intel/realsense/camera"
+          layout_dir = app / "src/main/res/layout"
+          activity_file = java_dir / "PreviewActivity.java"
+          layout_file = layout_dir / "activity_preview.xml"
 
-    /**
-     * Incremental RGB-D point-cloud fusion using lightweight point-to-point ICP.
-     * Coordinates are expressed in the first accepted camera frame. This is an
-     * online fusion preview, not a loop-closing SLAM or watertight-mesh system.
-     */
-    public final class PointCloudFusion {
-        private static final int MAX_POINTS = 120000;
-        private static final int MAX_ICP_SAMPLES = 700;
-        private static final int MAX_FRAME_POINTS = 3500;
-        private static final float VOXEL_SIZE = 0.015f;
-        private static final float CELL_SIZE = 0.10f;
-        private static final float MAX_DISTANCE = 0.09f;
-        private static final float MAX_DISTANCE_SQ = MAX_DISTANCE * MAX_DISTANCE;
-        private static final int ICP_ITERATIONS = 6;
-        private static final long MIN_INTERVAL_NS = 70_000_000L;
+          if not activity_file.exists() or not layout_file.exists():
+              raise SystemExit("Expected RealSense Camera preview sources were not found")
 
-        private final float[] mapXYZ = new float[MAX_POINTS * 3];
-        private final byte[] mapRGBA = new byte[MAX_POINTS * 4];
-        private final int[] mapSamples = new int[MAX_POINTS];
-        private volatile int mapCount = 0;
-        private final Map<Long, Integer> voxelIndex = new HashMap<>();
-        private final Map<Long, IntBucket> spatialIndex = new HashMap<>();
+          def replace_once(content: str, old: str, new: str, label: str) -> str:
+              count = content.count(old)
+              if count != 1:
+                  raise SystemExit(f"Patch anchor {label!r}: expected 1 match, found {count}")
+              return content.replace(old, new, 1)
 
-        // Rigid transform from current camera coordinates into the map frame.
-        private float[] poseR = identity3();
-        private float[] poseT = new float[3];
-        private boolean havePose = false;
-        private volatile boolean tracking = false;
-        private int acceptedFrames = 0;
-        private int rejectedFrames = 0;
-        private volatile long lastFusionNs = 0;
-        private volatile int sessionId = 0;
+          activity = activity_file.read_text()
+          activity = replace_once(
+              activity,
+              "import java.util.HashMap;\nimport java.util.Map;",
+              "import java.util.HashMap;\nimport java.util.Map;\n"
+              "import java.util.concurrent.ExecutorService;\n"
+              "import java.util.concurrent.Executors;\n"
+              "import java.util.concurrent.RejectedExecutionException;\n"
+              "import java.util.concurrent.atomic.AtomicInteger;",
+              "Java imports",
+          )
+          activity = replace_once(
+              activity,
+              "    private TextView mControlsButton;",
+              "    private TextView mControlsButton;\n"
+              "    private TextView mExportPlyButton;\n"
+              "\n"
+              "    // 0 = idle, 1 = waiting for the next frame, 2 = exporting.\n"
+              "    private final AtomicInteger mPlyExportState = new AtomicInteger(0);\n"
+              "    private final ExecutorService mPlyExportExecutor = Executors.newSingleThreadExecutor();",
+              "PLY export fields",
+          )
+          activity = replace_once(
+              activity,
+              "        mControlsButton = findViewById(R.id.controls_button);",
+              "        mControlsButton = findViewById(R.id.controls_button);\n"
+              "        mExportPlyButton = findViewById(R.id.preview_export_ply_button);",
+              "PLY button binding",
+          )
+          activity = replace_once(
+              activity,
+              "        mStatisticsButton.setOnClickListener(new View.OnClickListener() {",
+              indent(dedent("""\
+                      mExportPlyButton.setOnClickListener(new View.OnClickListener() {
+                          @Override
+                          public void onClick(View view) {
+                              if (mPlyExportState.compareAndSet(0, 1)) {
+                                  Toast.makeText(PreviewActivity.this,
+                                          "Сохраню облако точек со следующего кадра", Toast.LENGTH_SHORT).show();
+                              } else {
+                                  Toast.makeText(PreviewActivity.this,
+                                          "Экспорт уже выполняется", Toast.LENGTH_SHORT).show();
+                              }
+                          }
+                      });
 
-        public static final class Snapshot {
-            public final float[] vertices;
-            public final byte[] colors;
-            public final int pointCount;
-            private Snapshot(float[] vertices, byte[] colors, int pointCount) {
-                this.vertices = vertices;
-                this.colors = colors;
-                this.pointCount = pointCount;
-            }
-        }
+              """), "        ") + "        mStatisticsButton.setOnClickListener(new View.OnClickListener() {",
+              "PLY button listener",
+          )
+          activity = replace_once(
+              activity,
+              "                mStreamingStats.onFrameset(frameSet);",
+              indent(dedent("""\
+                              mStreamingStats.onFrameset(frameSet);
+                              if (mPlyExportState.compareAndSet(1, 2)) {
+                                  final FrameSet snapshot = frameSet.clone();
+                                  try {
+                                      mPlyExportExecutor.execute(() -> {
+                                          try {
+                                              final String savedLocation = PlySnapshotExporter.export(
+                                                      PreviewActivity.this, snapshot);
+                                              runOnUiThread(() -> Toast.makeText(
+                                                      PreviewActivity.this,
+                                                      "PLY сохранён: " + savedLocation,
+                                                      Toast.LENGTH_LONG).show());
+                                          } catch (Exception e) {
+                                              Log.e(TAG, "PLY export failed", e);
+                                              final String message = e.getMessage() == null
+                                                      ? e.getClass().getSimpleName() : e.getMessage();
+                                              runOnUiThread(() -> Toast.makeText(
+                                                      PreviewActivity.this,
+                                                      "Ошибка экспорта PLY: " + message,
+                                                      Toast.LENGTH_LONG).show());
+                                          } finally {
+                                              snapshot.close();
+                                              mPlyExportState.set(0);
+                                          }
+                                      });
+                                  } catch (RejectedExecutionException e) {
+                                      snapshot.close();
+                                      mPlyExportState.set(0);
+                                      Log.e(TAG, "PLY export executor rejected the task", e);
+                                  }
+                              }
+              """), "                "),
+              "frame callback export hook",
+          )
+          activity = replace_once(
+              activity,
+              "    protected void onDestroy() {\n        super.onDestroy();\n        mGLSurfaceView.close();\n    }",
+              "    protected void onDestroy() {\n"
+              "        super.onDestroy();\n"
+              "        mPlyExportExecutor.shutdown();\n"
+              "        mGLSurfaceView.close();\n"
+              "    }",
+              "export executor shutdown",
+          )
+          activity_file.write_text(activity)
 
-        private static final class IntBucket {
-            int[] values = new int[8];
-            int size = 0;
-            void add(int value) {
-                if (size == values.length) {
-                    int[] next = new int[values.length * 2];
-                    System.arraycopy(values, 0, next, 0, size);
-                    values = next;
-                }
-                values[size++] = value;
-            }
-        }
+          layout = layout_file.read_text()
+          layout = replace_once(
+              layout,
+              '            android:text="3D"/>',
+              '            android:text="3D"/>\n\n'
+              '        <Space\n'
+              '            android:layout_width="0dp"\n'
+              '            android:layout_height="1dp"\n'
+              '            android:layout_weight="1" />\n\n'
+              '        <TextView\n'
+              '            android:id="@+id/preview_export_ply_button"\n'
+              '            android:layout_width="wrap_content"\n'
+              '            android:layout_height="wrap_content"\n'
+              '            android:clickable="true"\n'
+              '            android:textSize="14dp"\n'
+              '            android:textColor="#ffffff"\n'
+              '            android:backgroundTint="#000000"\n'
+              '            android:text="PLY"/>',
+              "PLY button layout",
+          )
+          layout_file.write_text(layout)
 
-        private static final class PoseResult {
-            final float[] rotation;
-            final float[] translation;
-            final float rmse;
-            final int correspondences;
-            PoseResult(float[] rotation, float[] translation, float rmse, int correspondences) {
-                this.rotation = rotation;
-                this.translation = translation;
-                this.rmse = rmse;
-                this.correspondences = correspondences;
-            }
-        }
+          strings_file = app / "src/main/res/values/strings.xml"
+          strings = strings_file.read_text()
+          strings = replace_once(
+              strings,
+              '<string name="app_name">RS Camera</string>',
+              '<string name="app_name">RealSense 3D Studio</string>',
+              "app display name",
+          )
+          strings_file.write_text(strings)
 
-        public synchronized void reset() {
-            sessionId++;
-            mapCount = 0;
-            voxelIndex.clear();
-            spatialIndex.clear();
-            poseR = identity3();
-            poseT = new float[3];
-            havePose = false;
-            tracking = false;
-            acceptedFrames = 0;
-            rejectedFrames = 0;
-            lastFusionNs = 0;
-        }
+          exporter_file = java_dir / "PlySnapshotExporter.java"
+          exporter_source = dedent("""\
+              package com.intel.realsense.camera;
 
-        public int getPointCount() { return mapCount; }
-        public boolean isTracking() { return tracking; }
-        public synchronized int getAcceptedFrames() { return acceptedFrames; }
-        public synchronized int getRejectedFrames() { return rejectedFrames; }
-        public int getSessionId() { return sessionId; }
-        public boolean shouldIntegrateNow() {
-            return lastFusionNs == 0 || System.nanoTime() - lastFusionNs >= MIN_INTERVAL_NS;
-        }
+              import android.content.ContentResolver;
+              import android.content.ContentValues;
+              import android.content.Context;
+              import android.net.Uri;
+              import android.os.Build;
+              import android.os.Environment;
+              import android.provider.MediaStore;
 
-        /** Returns true only when the frame was registered and fused. */
-        public synchronized boolean integrate(float[] vertices, byte[] rgba) {
-            return integrate(vertices, rgba, sessionId);
-        }
+              import com.intel.realsense.librealsense.Extension;
+              import com.intel.realsense.librealsense.Frame;
+              import com.intel.realsense.librealsense.FrameSet;
+              import com.intel.realsense.librealsense.Pointcloud;
+              import com.intel.realsense.librealsense.Points;
+              import com.intel.realsense.librealsense.StreamType;
+              import com.intel.realsense.librealsense.VideoFrame;
 
-        public synchronized boolean integrate(float[] vertices, byte[] rgba, int expectedSessionId) {
-            if (expectedSessionId != sessionId) return false;
-            if (vertices == null || vertices.length < 300) return false;
-            long now = System.nanoTime();
-            if (lastFusionNs != 0 && now - lastFusionNs < MIN_INTERVAL_NS) return false;
-            lastFusionNs = now; // throttle failed registrations too, not only successful fusions
+              import java.io.File;
+              import java.io.FileInputStream;
+              import java.io.IOException;
+              import java.io.InputStream;
+              import java.io.OutputStream;
+              import java.text.SimpleDateFormat;
+              import java.util.Date;
+              import java.util.Locale;
 
-            int sourceCount = vertices.length / 3;
-            float[] samples = collectSamples(vertices, sourceCount);
-            int sampleCount = samples.length / 3;
-            if (sampleCount < 25) {
-                tracking = false;
-                rejectedFrames++;
-                return false;
-            }
+              /** Exports one synchronized RealSense depth/color frame as a colored PLY point cloud. */
+              public final class PlySnapshotExporter {
+                  private PlySnapshotExporter() { }
 
-            if (mapCount == 0 || !havePose) {
-                poseR = identity3();
-                poseT = new float[3];
-                havePose = true;
-                addFrameToMap(vertices, rgba, sourceCount, poseR, poseT);
-                tracking = mapCount > 0;
-                if (tracking) {
-                    acceptedFrames++;
-                    lastFusionNs = now;
-                }
-                return tracking;
-            }
+                  public static String export(Context context, FrameSet frames) throws Exception {
+                      File documents = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
+                      if (documents == null) {
+                          throw new IOException("External app storage is unavailable");
+                      }
 
-            PoseResult result = register(samples, sampleCount);
-            if (result == null) {
-                tracking = false;
-                rejectedFrames++;
-                return false;
-            }
+                      File outputDir = new File(documents, "RealSense3D");
+                      if (!outputDir.exists() && !outputDir.mkdirs()) {
+                          throw new IOException("Cannot create " + outputDir.getAbsolutePath());
+                      }
 
-            poseR = result.rotation;
-            poseT = result.translation;
-            addFrameToMap(vertices, rgba, sourceCount, poseR, poseT);
-            tracking = true;
-            acceptedFrames++;
-            lastFusionNs = now;
-            return true;
-        }
+                      String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
+                              .format(new Date());
+                      File output = new File(outputDir, "scan_" + stamp + ".ply");
+                      boolean complete = false;
 
-        private float[] collectSamples(float[] vertices, int pointCount) {
-            int step = Math.max(1, (pointCount + MAX_ICP_SAMPLES - 1) / MAX_ICP_SAMPLES);
-            float[] tmp = new float[Math.min(MAX_ICP_SAMPLES, pointCount) * 3];
-            int out = 0;
-            for (int i = 0; i < pointCount && out + 2 < tmp.length; i += step) {
-                int k = i * 3;
-                float x = vertices[k], y = vertices[k + 1], z = vertices[k + 2];
-                if (!validPoint(x, y, z)) continue;
-                tmp[out++] = x; tmp[out++] = y; tmp[out++] = z;
-            }
-            float[] result = new float[out];
-            System.arraycopy(tmp, 0, result, 0, out);
-            return result;
-        }
+                      try (Frame depth = frames.first(StreamType.DEPTH);
+                           Frame color = frames.first(StreamType.COLOR)) {
+                          if (depth == null) {
+                              throw new IllegalStateException("Depth stream is missing. Enable Depth in Settings.");
+                          }
+                          if (color == null) {
+                              throw new IllegalStateException("Color stream is missing. Enable Color in Settings.");
+                          }
+                          if (!depth.is(Extension.DEPTH_FRAME)) {
+                              throw new IllegalStateException("The received Depth frame has an unsupported format.");
+                          }
+                          if (!color.is(Extension.VIDEO_FRAME)) {
+                              throw new IllegalStateException("The received Color frame has an unsupported format.");
+                          }
 
-        private boolean validPoint(float x, float y, float z) {
-            return Float.isFinite(x) && Float.isFinite(y) && Float.isFinite(z)
-                    && z > 0.18f && z < 8.0f
-                    && Math.abs(x) < 8.0f && Math.abs(y) < 8.0f;
-        }
+                          try (Pointcloud pointcloud = new Pointcloud(StreamType.COLOR)) {
+                              Frame pointsFrame = pointcloud.process(depth);
+                              if (pointsFrame == depth) {
+                                  throw new IllegalStateException("RealSense did not produce a point cloud.");
+                              }
+                              try {
+                                  if (!pointsFrame.is(Extension.POINTS)) {
+                                      throw new IllegalStateException("Point cloud output is not valid.");
+                                  }
+                                  Points points = pointsFrame.as(Extension.POINTS);
+                                  VideoFrame texture = color.as(Extension.VIDEO_FRAME);
+                                  points.exportToPly(output.getAbsolutePath(), texture);
+                              } finally {
+                                  pointsFrame.close();
+                              }
+                          }
 
-        private PoseResult register(float[] samples, int sampleCount) {
-            float[] r = poseR.clone();
-            float[] t = poseT.clone();
-            float[] src = new float[sampleCount * 3];
-            float[] dst = new float[sampleCount * 3];
-            int lastMatches = 0;
-            float lastRmse = Float.POSITIVE_INFINITY;
+                          if (!output.isFile() || output.length() == 0) {
+                              throw new IOException("PLY file was not created or is empty");
+                          }
 
-            for (int iteration = 0; iteration < ICP_ITERATIONS; iteration++) {
-                int matches = 0;
-                double errorSum = 0.0;
-                for (int i = 0; i < sampleCount; i++) {
-                    int k = i * 3;
-                    float x = samples[k], y = samples[k + 1], z = samples[k + 2];
-                    float wx = r[0] * x + r[1] * y + r[2] * z + t[0];
-                    float wy = r[3] * x + r[4] * y + r[5] * z + t[1];
-                    float wz = r[6] * x + r[7] * y + r[8] * z + t[2];
-                    int nearest = findNearest(wx, wy, wz);
-                    if (nearest < 0) continue;
-                    float dx = wx - mapXYZ[nearest * 3];
-                    float dy = wy - mapXYZ[nearest * 3 + 1];
-                    float dz = wz - mapXYZ[nearest * 3 + 2];
-                    float d2 = dx * dx + dy * dy + dz * dz;
-                    if (d2 > MAX_DISTANCE_SQ) continue;
-                    int q = matches * 3;
-                    src[q] = wx; src[q + 1] = wy; src[q + 2] = wz;
-                    dst[q] = mapXYZ[nearest * 3];
-                    dst[q + 1] = mapXYZ[nearest * 3 + 1];
-                    dst[q + 2] = mapXYZ[nearest * 3 + 2];
-                    errorSum += d2;
-                    matches++;
-                }
+                          String location = publishToDownloads(context, output);
+                          complete = true;
+                          return location;
+                      } finally {
+                          if (!complete && output.exists()) {
+                              //noinspection ResultOfMethodCallIgnored
+                              output.delete();
+                          }
+                      }
+                  }
 
-                int minimum = Math.max(25, sampleCount / 12);
-                if (matches < minimum) return null;
-                float rmse = (float) Math.sqrt(errorSum / matches);
-                float[] deltaR = new float[9];
-                float[] deltaT = new float[3];
-                if (!solveRigid(src, dst, matches, deltaR, deltaT)) return null;
-                float shift = length(deltaT[0], deltaT[1], deltaT[2]);
-                float angle = rotationAngle(deltaR);
-                // Reject large jumps rather than painting a visibly doubled scan.
-                if (shift > 0.16f || angle > 0.65f) return null;
+                  private static String publishToDownloads(Context context, File source) throws Exception {
+                      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                          return source.getAbsolutePath();
+                      }
 
-                t = multiplyVector(deltaR, t);
-                t[0] += deltaT[0]; t[1] += deltaT[1]; t[2] += deltaT[2];
-                r = multiply3(deltaR, r);
-                lastMatches = matches;
-                lastRmse = rmse;
-                if (shift < 0.0015f && angle < 0.002f) break;
-            }
+                      ContentResolver resolver = context.getContentResolver();
+                      ContentValues values = new ContentValues();
+                      values.put(MediaStore.MediaColumns.DISPLAY_NAME, source.getName());
+                      values.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
+                      values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                              Environment.DIRECTORY_DOWNLOADS + "/RealSense3D");
+                      values.put(MediaStore.MediaColumns.IS_PENDING, 1);
 
-            int verified = 0;
-            double verifyError = 0.0;
-            for (int i = 0; i < sampleCount; i++) {
-                int k = i * 3;
-                float x = r[0] * samples[k] + r[1] * samples[k + 1] + r[2] * samples[k + 2] + t[0];
-                float y = r[3] * samples[k] + r[4] * samples[k + 1] + r[5] * samples[k + 2] + t[1];
-                float z = r[6] * samples[k] + r[7] * samples[k + 1] + r[8] * samples[k + 2] + t[2];
-                int nearest = findNearest(x, y, z);
-                if (nearest < 0) continue;
-                float dx = x - mapXYZ[nearest * 3];
-                float dy = y - mapXYZ[nearest * 3 + 1];
-                float dz = z - mapXYZ[nearest * 3 + 2];
-                float d2 = dx * dx + dy * dy + dz * dz;
-                if (d2 <= MAX_DISTANCE_SQ) { verifyError += d2; verified++; }
-            }
-            int minimum = Math.max(25, sampleCount / 12);
-            if (verified < minimum) return null;
-            float rmse = (float) Math.sqrt(verifyError / verified);
-            if (!Float.isFinite(rmse) || rmse > 0.065f) return null;
-            if (lastMatches < minimum || lastRmse > 0.075f) return null;
-            return new PoseResult(r, t, rmse, verified);
-        }
+                      Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                      if (uri == null) {
+                          throw new IOException("Could not create a file in Downloads/RealSense3D");
+                      }
 
-        private int findNearest(float x, float y, float z) {
-            int cx = floorCell(x), cy = floorCell(y), cz = floorCell(z);
-            int best = -1;
-            float bestD2 = MAX_DISTANCE_SQ;
-            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++)
-                for (int dz = -1; dz <= 1; dz++) {
-                    IntBucket bucket = spatialIndex.get(pack(cx + dx, cy + dy, cz + dz));
-                    if (bucket == null) continue;
-                    for (int j = 0; j < bucket.size; j++) {
-                        int idx = bucket.values[j], k = idx * 3;
-                        float ax = x - mapXYZ[k], ay = y - mapXYZ[k + 1], az = z - mapXYZ[k + 2];
-                        float d2 = ax * ax + ay * ay + az * az;
-                        if (d2 < bestD2) { bestD2 = d2; best = idx; }
-                    }
-                }
-            return best;
-        }
+                      try {
+                          try (InputStream input = new FileInputStream(source);
+                               OutputStream output = resolver.openOutputStream(uri)) {
+                              if (output == null) {
+                                  throw new IOException("Could not open the exported PLY destination");
+                              }
+                              byte[] buffer = new byte[64 * 1024];
+                              int count;
+                              while ((count = input.read(buffer)) != -1) {
+                                  output.write(buffer, 0, count);
+                              }
+                              output.flush();
+                          }
 
-        private void addFrameToMap(float[] vertices, byte[] rgba, int pointCount,
-                                   float[] r, float[] t) {
-            int step = Math.max(1, (pointCount + MAX_FRAME_POINTS - 1) / MAX_FRAME_POINTS);
-            for (int i = 0; i < pointCount; i += step) {
-                int k = i * 3;
-                float x = vertices[k], y = vertices[k + 1], z = vertices[k + 2];
-                if (!validPoint(x, y, z)) continue;
-                float wx = r[0] * x + r[1] * y + r[2] * z + t[0];
-                float wy = r[3] * x + r[4] * y + r[5] * z + t[1];
-                float wz = r[6] * x + r[7] * y + r[8] * z + t[2];
-                int p = i * 4;
-                int red = rgba != null && p + 2 < rgba.length ? rgba[p] & 255 : grayFromDepth(wz);
-                int green = rgba != null && p + 2 < rgba.length ? rgba[p + 1] & 255 : red;
-                int blue = rgba != null && p + 2 < rgba.length ? rgba[p + 2] & 255 : red;
-                addMapPoint(wx, wy, wz, red, green, blue);
-            }
-        }
+                          ContentValues publish = new ContentValues();
+                          publish.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                          if (resolver.update(uri, publish, null, null) < 1) {
+                              throw new IOException("Could not publish the PLY file in Downloads");
+                          }
 
-        private int grayFromDepth(float z) {
-            return Math.max(32, Math.min(220, (int) (220.0f - z * 28.0f)));
-        }
+                          //noinspection ResultOfMethodCallIgnored
+                          source.delete();
+                          return "Downloads/RealSense3D/" + source.getName();
+                      } catch (Exception e) {
+                          resolver.delete(uri, null, null);
+                          throw e;
+                      }
+                  }
+              }
+              """)
+          if exporter_file.exists():
+              raise SystemExit(f"Refusing to overwrite unexpected existing file: {exporter_file}")
+          exporter_file.write_text(exporter_source)
 
-        private void addMapPoint(float x, float y, float z, int red, int green, int blue) {
-            int vx = (int) Math.floor(x / VOXEL_SIZE);
-            int vy = (int) Math.floor(y / VOXEL_SIZE);
-            int vz = (int) Math.floor(z / VOXEL_SIZE);
-            long vk = pack(vx, vy, vz);
-            Integer existing = voxelIndex.get(vk);
-            if (existing != null) {
-                int idx = existing;
-                int n = Math.min(64, mapSamples[idx]);
-                float inv = 1.0f / (n + 1.0f);
-                int q = idx * 3;
-                mapXYZ[q] += (x - mapXYZ[q]) * inv;
-                mapXYZ[q + 1] += (y - mapXYZ[q + 1]) * inv;
-                mapXYZ[q + 2] += (z - mapXYZ[q + 2]) * inv;
-                int c = idx * 4;
-                mapRGBA[c] = (byte) ((mapRGBA[c] & 255) + (red - (mapRGBA[c] & 255)) * inv);
-                mapRGBA[c + 1] = (byte) ((mapRGBA[c + 1] & 255) + (green - (mapRGBA[c + 1] & 255)) * inv);
-                mapRGBA[c + 2] = (byte) ((mapRGBA[c + 2] & 255) + (blue - (mapRGBA[c + 2] & 255)) * inv);
-                mapSamples[idx] = Math.min(64, n + 1);
-                return;
-            }
-            if (mapCount >= MAX_POINTS) return;
-            int index = mapCount++;
-            int q = index * 3;
-            mapXYZ[q] = x; mapXYZ[q + 1] = y; mapXYZ[q + 2] = z;
-            int c = index * 4;
-            mapRGBA[c] = (byte) red; mapRGBA[c + 1] = (byte) green;
-            mapRGBA[c + 2] = (byte) blue; mapRGBA[c + 3] = (byte) 255;
-            mapSamples[index] = 1;
-            voxelIndex.put(vk, index);
-            long cellKey = pack(floorCell(x), floorCell(y), floorCell(z));
-            IntBucket bucket = spatialIndex.get(cellKey);
-            if (bucket == null) { bucket = new IntBucket(); spatialIndex.put(cellKey, bucket); }
-            bucket.add(index);
-        }
+          print("Added PLY snapshot export to the RealSense Camera app")
+          PY
 
-        private static int floorCell(float value) { return (int) Math.floor(value / CELL_SIZE); }
-        private static long pack(int x, int y, int z) {
-            return (((long) x & 0x1fffffL) << 42)
-                    | (((long) y & 0x1fffffL) << 21)
-                    | ((long) z & 0x1fffffL);
-        }
+      # Add live ICP registration, asynchronous fusion, and a persistent on-screen cloud.
+      - name: Add live point-cloud scan fusion
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
 
-        public synchronized Snapshot snapshot() {
-            float[] xyz = new float[mapCount * 3];
-            byte[] rgba = new byte[mapCount * 4];
-            System.arraycopy(mapXYZ, 0, xyz, 0, xyz.length);
-            System.arraycopy(mapRGBA, 0, rgba, 0, rgba.length);
-            return new Snapshot(xyz, rgba, mapCount);
-        }
+          app = Path("source/wrappers/android/tools/camera")
+          java_dir = app / "src/main/java/com/intel/realsense/camera"
+          rs_java = Path("source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense")
+          activity_file = java_dir / "PreviewActivity.java"
+          layout_file = app / "src/main/res/layout/activity_preview.xml"
+          renderer_file = rs_java / "GLRenderer.java"
+          points_view_file = rs_java / "GLPointsFrame.java"
+          rs_surface_file = rs_java / "GLRsSurfaceView.java"
+          exporter_file = java_dir / "PlySnapshotExporter.java"
+          app_gradle_file = app / "build.gradle"
 
-        public void writePly(File file) throws IOException {
-            Snapshot data = snapshot(); // copy under lock; disk I/O happens without blocking frame fusion
-            if (data.pointCount == 0) throw new IOException("Нет накопленных точек. Сначала запустите сканирование.");
-            File parent = file.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs())
-                throw new IOException("Не удалось создать каталог для PLY");
-            try (BufferedWriter writer = new BufferedWriter(new FileWriter(file), 256 * 1024)) {
-                writer.write("ply\nformat ascii 1.0\n");
-                writer.write("element vertex " + data.pointCount + "\n");
-                writer.write("property float x\nproperty float y\nproperty float z\n");
-                writer.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n");
-                for (int i = 0; i < data.pointCount; i++) {
-                    int p = i * 3, c = i * 4;
-                    writer.write(Float.toString(data.vertices[p])); writer.write(' ');
-                    writer.write(Float.toString(data.vertices[p + 1])); writer.write(' ');
-                    writer.write(Float.toString(data.vertices[p + 2])); writer.write(' ');
-                    writer.write(Integer.toString(data.colors[c] & 255)); writer.write(' ');
-                    writer.write(Integer.toString(data.colors[c + 1] & 255)); writer.write(' ');
-                    writer.write(Integer.toString(data.colors[c + 2] & 255)); writer.write('\n');
-                }
-            }
-        }
+          for required in (activity_file, layout_file, renderer_file, points_view_file, rs_surface_file, exporter_file, app_gradle_file):
+              if not required.exists():
+                  raise SystemExit(f"Required source file not found: {required}")
 
-        private static boolean solveRigid(float[] src, float[] dst, int count,
-                                          float[] outR, float[] outT) {
-            if (count < 3) return false;
-            double sx = 0, sy = 0, sz = 0, tx = 0, ty = 0, tz = 0;
-            for (int i = 0; i < count; i++) {
-                int k = i * 3;
-                sx += src[k]; sy += src[k + 1]; sz += src[k + 2];
-                tx += dst[k]; ty += dst[k + 1]; tz += dst[k + 2];
-            }
-            double inv = 1.0 / count;
-            sx *= inv; sy *= inv; sz *= inv; tx *= inv; ty *= inv; tz *= inv;
-            double sxx = 0, sxy = 0, sxz = 0, syx = 0, syy = 0, syz = 0,
-                    szx = 0, szy = 0, szz = 0;
-            for (int i = 0; i < count; i++) {
-                int k = i * 3;
-                double ax = src[k] - sx, ay = src[k + 1] - sy, az = src[k + 2] - sz;
-                double bx = dst[k] - tx, by = dst[k + 1] - ty, bz = dst[k + 2] - tz;
-                sxx += ax * bx; sxy += ax * by; sxz += ax * bz;
-                syx += ay * bx; syy += ay * by; syz += ay * bz;
-                szx += az * bx; szy += az * by; szz += az * bz;
-            }
-            double[][] n = new double[4][4];
-            n[0][0] = sxx + syy + szz;
-            n[0][1] = n[1][0] = syz - szy;
-            n[0][2] = n[2][0] = szx - sxz;
-            n[0][3] = n[3][0] = sxy - syx;
-            n[1][1] = sxx - syy - szz;
-            n[1][2] = n[2][1] = sxy + syx;
-            n[1][3] = n[3][1] = szx + sxz;
-            n[2][2] = -sxx + syy - szz;
-            n[2][3] = n[3][2] = syz + szy;
-            n[3][3] = -sxx - syy + szz;
+          def replace_once(content: str, old: str, new: str, label: str) -> str:
+              count = content.count(old)
+              if count != 1:
+                  raise SystemExit(f"Patch anchor {label!r}: expected exactly 1 match, found {count}")
+              return content.replace(old, new, 1)
 
-            double[][] eigenvectors = new double[4][4];
-            for (int i = 0; i < 4; i++) eigenvectors[i][i] = 1.0;
-            for (int iteration = 0; iteration < 40; iteration++) {
-                int p = 0, q = 1;
-                double largest = Math.abs(n[p][q]);
-                for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
-                    double value = Math.abs(n[i][j]);
-                    if (value > largest) { largest = value; p = i; q = j; }
-                }
-                if (largest < 1e-10) break;
-                double theta = 0.5 * Math.atan2(2.0 * n[p][q], n[q][q] - n[p][p]);
-                double c = Math.cos(theta), s = Math.sin(theta);
-                double app = n[p][p], aqq = n[q][q], apq = n[p][q];
-                n[p][p] = c * c * app - 2 * s * c * apq + s * s * aqq;
-                n[q][q] = s * s * app + 2 * s * c * apq + c * c * aqq;
-                n[p][q] = n[q][p] = 0.0;
-                for (int k = 0; k < 4; k++) {
-                    if (k == p || k == q) continue;
-                    double akp = n[k][p], akq = n[k][q];
-                    n[k][p] = n[p][k] = c * akp - s * akq;
-                    n[k][q] = n[q][k] = s * akp + c * akq;
-                }
-                for (int k = 0; k < 4; k++) {
-                    double vkp = eigenvectors[k][p], vkq = eigenvectors[k][q];
-                    eigenvectors[k][p] = c * vkp - s * vkq;
-                    eigenvectors[k][q] = s * vkp + c * vkq;
-                }
-            }
-            int best = 0;
-            for (int i = 1; i < 4; i++) if (n[i][i] > n[best][best]) best = i;
-            double qw = eigenvectors[0][best], qx = eigenvectors[1][best];
-            double qy = eigenvectors[2][best], qz = eigenvectors[3][best];
-            double norm = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
-            if (norm < 1e-12) return false;
-            qw /= norm; qx /= norm; qy /= norm; qz /= norm;
-            outR[0] = (float) (1 - 2 * (qy * qy + qz * qz));
-            outR[1] = (float) (2 * (qx * qy - qz * qw));
-            outR[2] = (float) (2 * (qx * qz + qy * qw));
-            outR[3] = (float) (2 * (qx * qy + qz * qw));
-            outR[4] = (float) (1 - 2 * (qx * qx + qz * qz));
-            outR[5] = (float) (2 * (qy * qz - qx * qw));
-            outR[6] = (float) (2 * (qx * qz - qy * qw));
-            outR[7] = (float) (2 * (qy * qz + qx * qw));
-            outR[8] = (float) (1 - 2 * (qx * qx + qy * qy));
-            outT[0] = (float) (tx - (outR[0] * sx + outR[1] * sy + outR[2] * sz));
-            outT[1] = (float) (ty - (outR[3] * sx + outR[4] * sy + outR[5] * sz));
-            outT[2] = (float) (tz - (outR[6] * sx + outR[7] * sy + outR[8] * sz));
-            return true;
-        }
+          # 1) Add the on-device incremental ICP fusion engine.
+          fusion_file = rs_java / "PointCloudFusion.java"
+          if fusion_file.exists():
+              raise SystemExit(f"Refusing to overwrite unexpected file: {fusion_file}")
+          fusion_file.write_text(dedent(r'''
+              package com.intel.realsense.librealsense;
 
-        private static float[] identity3() { return new float[]{1,0,0, 0,1,0, 0,0,1}; }
-        private static float[] multiply3(float[] a, float[] b) {
-            float[] r = new float[9];
-            for (int row = 0; row < 3; row++) for (int col = 0; col < 3; col++)
-                r[row * 3 + col] = a[row * 3] * b[col] + a[row * 3 + 1] * b[3 + col]
-                        + a[row * 3 + 2] * b[6 + col];
-            return r;
-        }
-        private static float[] multiplyVector(float[] r, float[] v) {
-            return new float[]{r[0]*v[0]+r[1]*v[1]+r[2]*v[2],
-                    r[3]*v[0]+r[4]*v[1]+r[5]*v[2],
-                    r[6]*v[0]+r[7]*v[1]+r[8]*v[2]};
-        }
-        private static float length(float x, float y, float z) {
-            return (float) Math.sqrt(x*x + y*y + z*z);
-        }
-        private static float rotationAngle(float[] r) {
-            float c = Math.max(-1.0f, Math.min(1.0f, (r[0] + r[4] + r[8] - 1.0f) * 0.5f));
-            return (float) Math.acos(c);
-        }
-    }
-    ''').lstrip())
+              import java.io.BufferedWriter;
+              import java.io.File;
+              import java.io.FileWriter;
+              import java.io.IOException;
+              import java.util.HashMap;
+              import java.util.Locale;
+              import java.util.Map;
 
-# 2) Let GLPointsFrame display a persistent fused cloud, using reusable direct GL buffers.
-points_view = points_view_file.read_text()
-points_view = replace_once(points_view,
-    "import java.nio.ByteOrder;\nimport java.nio.IntBuffer;",
-    "import java.nio.ByteOrder;\nimport java.nio.IntBuffer;\nimport java.nio.FloatBuffer;",
-    "GLPointsFrame FloatBuffer import")
-points_view = replace_once(points_view,
-    "    private
+              /**
+               * Incremental RGB-D point-cloud fusion using lightweight point-to-point ICP.
+               * Coordinates are expressed in the first accepted camera frame. This is an
+               * online fusion preview, not a loop-closing SLAM or watertight-mesh system.
+               */
+              public final class PointCloudFusion {
+                  private static final int MAX_POINTS = 120000;
+                  private static final int MAX_ICP_SAMPLES = 700;
+                  private static final int MAX_FRAME_POINTS = 3500;
+                  private static final float VOXEL_SIZE = 0.015f;
+                  private static final float CELL_SIZE = 0.10f;
+                  private static final float MAX_DISTANCE = 0.09f;
+                  private static final float MAX_DISTANCE_SQ = MAX_DISTANCE * MAX_DISTANCE;
+                  private static final int ICP_ITERATIONS = 6;
+                  private static final long MIN_INTERVAL_NS = 70_000_000L;
+
+                  private final float[] mapXYZ = new float[MAX_POINTS * 3];
+                  private final byte[] mapRGBA = new byte[MAX_POINTS * 4];
+                  private final int[] mapSamples = new int[MAX_POINTS];
+                  private volatile int mapCount = 0;
+                  private final Map<Long, Integer> voxelIndex = new HashMap<>();
+                  private final Map<Long, IntBucket> spatialIndex = new HashMap<>();
+
+                  // Rigid transform from current camera coordinates into the map frame.
+                  private float[] poseR = identity3();
+                  private float[] poseT = new float[3];
+                  private boolean havePose = false;
+                  private volatile boolean tracking = false;
+                  private int acceptedFrames = 0;
+                  private int rejectedFrames = 0;
+                  private volatile long lastFusionNs = 0;
+                  private volatile int sessionId = 0;
+
+                  public static final class Snapshot {
+                      public final float[] vertices;
+                      public final byte[] colors;
+                      public final int pointCount;
+                      private Snapshot(float[] vertices, byte[] colors, int pointCount) {
+                          this.vertices = vertices;
+                          this.colors = colors;
+                          this.pointCount = pointCount;
+                      }
+                  }
+
+                  private static final class IntBucket {
+                      int[] values = new int[8];
+                      int size = 0;
+                      void add(int value) {
+                          if (size == values.length) {
+                              int[] next = new int[values.length * 2];
+                              System.arraycopy(values, 0, next, 0, size);
+                              values = next;
+                          }
+                          values[size++] = value;
+                      }
+                  }
+
+                  private static final class PoseResult {
+                      final float[] rotation;
+                      final float[] translation;
+                      final float rmse;
+                      final int correspondences;
+                      PoseResult(float[] rotation, float[] translation, float rmse, int correspondences) {
+                          this.rotation = rotation;
+                          this.translation = translation;
+                          this.rmse = rmse;
+                          this.correspondences = correspondences;
+                      }
+                  }
+
+                  public synchronized void reset() {
+                      sessionId++;
+                      mapCount = 0;
+                      voxelIndex.clear();
+                      spatialIndex.clear();
+                      poseR = identity3();
+                      poseT = new float[3];
+                      havePose = false;
+                      tracking = false;
+                      acceptedFrames = 0;
+                      rejectedFrames = 0;
+                      lastFusionNs = 0;
+                  }
+
+                  public int getPointCount() { return mapCount; }
+                  public boolean isTracking() { return tracking; }
+                  public synchronized int getAcceptedFrames() { return acceptedFrames; }
+                  public synchronized int getRejectedFrames() { return rejectedFrames; }
+                  public int getSessionId() { return sessionId; }
+                  public boolean shouldIntegrateNow() {
+                      return lastFusionNs == 0 || System.nanoTime() - lastFusionNs >= MIN_INTERVAL_NS;
+                  }
+
+                  /** Returns true only when the frame was registered and fused. */
+                  public synchronized boolean integrate(float[] vertices, byte[] rgba) {
+                      return integrate(vertices, rgba, sessionId);
+                  }
+
+                  public synchronized boolean integrate(float[] vertices, byte[] rgba, int expectedSessionId) {
+                      if (expectedSessionId != sessionId) return false;
+                      if (vertices == null || vertices.length < 300) return false;
+                      long now = System.nanoTime();
+                      if (lastFusionNs != 0 && now - lastFusionNs < MIN_INTERVAL_NS) return false;
+                      lastFusionNs = now; // throttle failed registrations too, not only successful fusions
+
+                      int sourceCount = vertices.length / 3;
+                      float[] samples = collectSamples(vertices, sourceCount);
+                      int sampleCount = samples.length / 3;
+                      if (sampleCount < 25) {
+                          tracking = false;
+                          rejectedFrames++;
+                          return false;
+                      }
+
+                      if (mapCount == 0 || !havePose) {
+                          poseR = identity3();
+                          poseT = new float[3];
+                          havePose = true;
+                          addFrameToMap(vertices, rgba, sourceCount, poseR, poseT);
+                          tracking = mapCount > 0;
+                          if (tracking) {
+                              acceptedFrames++;
+                              lastFusionNs = now;
+                          }
+                          return tracking;
+                      }
+
+                      PoseResult result = register(samples, sampleCount);
+                      if (result == null) {
+                          tracking = false;
+                          rejectedFrames++;
+                          return false;
+                      }
+
+                      poseR = result.rotation;
+                      poseT = result.translation;
+                      addFrameToMap(vertices, rgba, sourceCount, poseR, poseT);
+                      tracking = true;
+                      acceptedFrames++;
+                      lastFusionNs = now;
+                      return true;
+                  }
+
+                  private float[] collectSamples(float[] vertices, int pointCount) {
+                      int step = Math.max(1, (pointCount + MAX_ICP_SAMPLES - 1) / MAX_ICP_SAMPLES);
+                      float[] tmp = new float[Math.min(MAX_ICP_SAMPLES, pointCount) * 3];
+                      int out = 0;
+                      for (int i = 0; i < pointCount && out + 2 < tmp.length; i += step) {
+                          int k = i * 3;
+                          float x = vertices[k], y = vertices[k + 1], z = vertices[k + 2];
+                          if (!validPoint(x, y, z)) continue;
+                          tmp[out++] = x; tmp[out++] = y; tmp[out++] = z;
+                      }
+                      float[] result = new float[out];
+                      System.arraycopy(tmp, 0, result, 0, out);
+                      return result;
+                  }
+
+                  private boolean validPoint(float x, float y, float z) {
+                      return Float.isFinite(x) && Float.isFinite(y) && Float.isFinite(z)
+                              && z > 0.18f && z < 8.0f
+                              && Math.abs(x) < 8.0f && Math.abs(y) < 8.0f;
+                  }
+
+                  private PoseResult register(float[] samples, int sampleCount) {
+                      float[] r = poseR.clone();
+                      float[] t = poseT.clone();
+                      float[] src = new float[sampleCount * 3];
+                      float[] dst = new float[sampleCount * 3];
+                      int lastMatches = 0;
+                      float lastRmse = Float.POSITIVE_INFINITY;
+
+                      for (int iteration = 0; iteration < ICP_ITERATIONS; iteration++) {
+                          int matches = 0;
+                          double errorSum = 0.0;
+                          for (int i = 0; i < sampleCount; i++) {
+                              int k = i * 3;
+                              float x = samples[k], y = samples[k + 1], z = samples[k + 2];
+                              float wx = r[0] * x + r[1] * y + r[2] * z + t[0];
+                              float wy = r[3] * x + r[4] * y + r[5] * z + t[1];
+                              float wz = r[6] * x + r[7] * y + r[8] * z + t[2];
+                              int nearest = findNearest(wx, wy, wz);
+                              if (nearest < 0) continue;
+                              float dx = wx - mapXYZ[nearest * 3];
+                              float dy = wy - mapXYZ[nearest * 3 + 1];
+                              float dz = wz - mapXYZ[nearest * 3 + 2];
+                              float d2 = dx * dx + dy * dy + dz * dz;
+                              if (d2 > MAX_DISTANCE_SQ) continue;
+                              int q = matches * 3;
+                              src[q] = wx; src[q + 1] = wy; src[q + 2] = wz;
+                              dst[q] = mapXYZ[nearest * 3];
+                              dst[q + 1] = mapXYZ[nearest * 3 + 1];
+                              dst[q + 2] = mapXYZ[nearest * 3 + 2];
+                              errorSum += d2;
+                              matches++;
+                          }
+
+                          int minimum = Math.max(25, sampleCount / 12);
+                          if (matches < minimum) return null;
+                          float rmse = (float) Math.sqrt(errorSum / matches);
+                          float[] deltaR = new float[9];
+                          float[] deltaT = new float[3];
+                          if (!solveRigid(src, dst, matches, deltaR, deltaT)) return null;
+                          float shift = length(deltaT[0], deltaT[1], deltaT[2]);
+                          float angle = rotationAngle(deltaR);
+                          // Reject large jumps rather than painting a visibly doubled scan.
+                          if (shift > 0.16f || angle > 0.65f) return null;
+
+                          t = multiplyVector(deltaR, t);
+                          t[0] += deltaT[0]; t[1] += deltaT[1]; t[2] += deltaT[2];
+                          r = multiply3(deltaR, r);
+                          lastMatches = matches;
+                          lastRmse = rmse;
+                          if (shift < 0.0015f && angle < 0.002f) break;
+                      }
+
+                      int verified = 0;
+                      double verifyError = 0.0;
+                      for (int i = 0; i < sampleCount; i++) {
+                          int k = i * 3;
+                          float x = r[0] * samples[k] + r[1] * samples[k + 1] + r[2] * samples[k + 2] + t[0];
+                          float y = r[3] * samples[k] + r[4] * samples[k + 1] + r[5] * samples[k + 2] + t[1];
+                          float z = r[6] * samples[k] + r[7] * samples[k + 1] + r[8] * samples[k + 2] + t[2];
+                          int nearest = findNearest(x, y, z);
+                          if (nearest < 0) continue;
+                          float dx = x - mapXYZ[nearest * 3];
+                          float dy = y - mapXYZ[nearest * 3 + 1];
+                          float dz = z - mapXYZ[nearest * 3 + 2];
+                          float d2 = dx * dx + dy * dy + dz * dz;
+                          if (d2 <= MAX_DISTANCE_SQ) { verifyError += d2; verified++; }
+                      }
+                      int minimum = Math.max(25, sampleCount / 12);
+                      if (verified < minimum) return null;
+                      float rmse = (float) Math.sqrt(verifyError / verified);
+                      if (!Float.isFinite(rmse) || rmse > 0.065f) return null;
+                      if (lastMatches < minimum || lastRmse > 0.075f) return null;
+                      return new PoseResult(r, t, rmse, verified);
+                  }
+
+                  private int findNearest(float x, float y, float z) {
+                      int cx = floorCell(x), cy = floorCell(y), cz = floorCell(z);
+                      int best = -1;
+                      float bestD2 = MAX_DISTANCE_SQ;
+                      for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++)
+                          for (int dz = -1; dz <= 1; dz++) {
+                              IntBucket bucket = spatialIndex.get(pack(cx + dx, cy + dy, cz + dz));
+                              if (bucket == null) continue;
+                              for (int j = 0; j < bucket.size; j++) {
+                                  int idx = bucket.values[j], k = idx * 3;
+                                  float ax = x - mapXYZ[k], ay = y - mapXYZ[k + 1], az = z - mapXYZ[k + 2];
+                                  float d2 = ax * ax + ay * ay + az * az;
+                                  if (d2 < bestD2) { bestD2 = d2; best = idx; }
+                              }
+                          }
+                      return best;
+                  }
+
+                  private void addFrameToMap(float[] vertices, byte[] rgba, int pointCount,
+                                             float[] r, float[] t) {
+                      int step = Math.max(1, (pointCount + MAX_FRAME_POINTS - 1) / MAX_FRAME_POINTS);
+                      for (int i = 0; i < pointCount; i += step) {
+                          int k = i * 3;
+                          float x = vertices[k], y = vertices[k + 1], z = vertices[k + 2];
+                          if (!validPoint(x, y, z)) continue;
+                          float wx = r[0] * x + r[1] * y + r[2] * z + t[0];
+                          float wy = r[3] * x + r[4] * y + r[5] * z + t[1];
+                          float wz = r[6] * x + r[7] * y + r[8] * z + t[2];
+                          int p = i * 4;
+                          int red = rgba != null && p + 2 < rgba.length ? rgba[p] & 255 : grayFromDepth(wz);
+                          int green = rgba != null && p + 2 < rgba.length ? rgba[p + 1] & 255 : red;
+                          int blue = rgba != null && p + 2 < rgba.length ? rgba[p + 2] & 255 : red;
+                          addMapPoint(wx, wy, wz, red, green, blue);
+                      }
+                  }
+
+                  private int grayFromDepth(float z) {
+                      return Math.max(32, Math.min(220, (int) (220.0f - z * 28.0f)));
+                  }
+
+                  private void addMapPoint(float x, float y, float z, int red, int green, int blue) {
+                      int vx = (int) Math.floor(x / VOXEL_SIZE);
+                      int vy = (int) Math.floor(y / VOXEL_SIZE);
+                      int vz = (int) Math.floor(z / VOXEL_SIZE);
+                      long vk = pack(vx, vy, vz);
+                      Integer existing = voxelIndex.get(vk);
+                      if (existing != null) {
+                          int idx = existing;
+                          int n = Math.min(64, mapSamples[idx]);
+                          float inv = 1.0f / (n + 1.0f);
+                          int q = idx * 3;
+                          mapXYZ[q] += (x - mapXYZ[q]) * inv;
+                          mapXYZ[q + 1] += (y - mapXYZ[q + 1]) * inv;
+                          mapXYZ[q + 2] += (z - mapXYZ[q + 2]) * inv;
+                          int c = idx * 4;
+                          mapRGBA[c] = (byte) ((mapRGBA[c] & 255) + (red - (mapRGBA[c] & 255)) * inv);
+                          mapRGBA[c + 1] = (byte) ((mapRGBA[c + 1] & 255) + (green - (mapRGBA[c + 1] & 255)) * inv);
+                          mapRGBA[c + 2] = (byte) ((mapRGBA[c + 2] & 255) + (blue - (mapRGBA[c + 2] & 255)) * inv);
+                          mapSamples[idx] = Math.min(64, n + 1);
+                          return;
+                      }
+                      if (mapCount >= MAX_POINTS) return;
+                      int index = mapCount++;
+                      int q = index * 3;
+                      mapXYZ[q] = x; mapXYZ[q + 1] = y; mapXYZ[q + 2] = z;
+                      int c = index * 4;
+                      mapRGBA[c] = (byte) red; mapRGBA[c + 1] = (byte) green;
+                      mapRGBA[c + 2] = (byte) blue; mapRGBA[c + 3] = (byte) 255;
+                      mapSamples[index] = 1;
+                      voxelIndex.put(vk, index);
+                      long cellKey = pack(floorCell(x), floorCell(y), floorCell(z));
+                      IntBucket bucket = spatialIndex.get(cellKey);
+                      if (bucket == null) { bucket = new IntBucket(); spatialIndex.put(cellKey, bucket); }
+                      bucket.add(index);
+                  }
+
+                  private static int floorCell(float value) { return (int) Math.floor(value / CELL_SIZE); }
+                  private static long pack(int x, int y, int z) {
+                      return (((long) x & 0x1fffffL) << 42)
+                              | (((long) y & 0x1fffffL) << 21)
+                              | ((long) z & 0x1fffffL);
+                  }
+
+                  public synchronized Snapshot snapshot() {
+                      float[] xyz = new float[mapCount * 3];
+                      byte[] rgba = new byte[mapCount * 4];
+                      System.arraycopy(mapXYZ, 0, xyz, 0, xyz.length);
+                      System.arraycopy(mapRGBA, 0, rgba, 0, rgba.length);
+                      return new Snapshot(xyz, rgba, mapCount);
+                  }
+
+                  public void writePly(File file) throws IOException {
+                      Snapshot data = snapshot(); // copy under lock; disk I/O happens without blocking frame fusion
+                      if (data.pointCount == 0) throw new IOException("Нет накопленных точек. Сначала запустите сканирование.");
+                      File parent = file.getParentFile();
+                      if (parent != null && !parent.exists() && !parent.mkdirs())
+                          throw new IOException("Не удалось создать каталог для PLY");
+                      try (BufferedWriter writer = new BufferedWriter(new FileWriter(file), 256 * 1024)) {
+                          writer.write("ply\nformat ascii 1.0\n");
+                          writer.write("element vertex " + data.pointCount + "\n");
+                          writer.write("property float x\nproperty float y\nproperty float z\n");
+                          writer.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n");
+                          for (int i = 0; i < data.pointCount; i++) {
+                              int p = i * 3, c = i * 4;
+                              writer.write(Float.toString(data.vertices[p])); writer.write(' ');
+                              writer.write(Float.toString(data.vertices[p + 1])); writer.write(' ');
+                              writer.write(Float.toString(data.vertices[p + 2])); writer.write(' ');
+                              writer.write(Integer.toString(data.colors[c] & 255)); writer.write(' ');
+                              writer.write(Integer.toString(data.colors[c + 1] & 255)); writer.write(' ');
+                              writer.write(Integer.toString(data.colors[c + 2] & 255)); writer.write('\n');
+                          }
+                      }
+                  }
+
+                  private static boolean solveRigid(float[] src, float[] dst, int count,
+                                                    float[] outR, float[] outT) {
+                      if (count < 3) return false;
+                      double sx = 0, sy = 0, sz = 0, tx = 0, ty = 0, tz = 0;
+                      for (int i = 0; i < count; i++) {
+                          int k = i * 3;
+                          sx += src[k]; sy += src[k + 1]; sz += src[k + 2];
+                          tx += dst[k]; ty += dst[k + 1]; tz += dst[k + 2];
+                      }
+                      double inv = 1.0 / count;
+                      sx *= inv; sy *= inv; sz *= inv; tx *= inv; ty *= inv; tz *= inv;
+                      double sxx = 0, sxy = 0, sxz = 0, syx = 0, syy = 0, syz = 0,
+                              szx = 0, szy = 0, szz = 0;
+                      for (int i = 0; i < count; i++) {
+                          int k = i * 3;
+                          double ax = src[k] - sx, ay = src[k + 1] - sy, az = src[k + 2] - sz;
+                          double bx = dst[k] - tx, by = dst[k + 1] - ty, bz = dst[k + 2] - tz;
+                          sxx += ax * bx; sxy += ax * by; sxz += ax * bz;
+                          syx += ay * bx; syy += ay * by; syz += ay * bz;
+                          szx += az * bx; szy += az * by; szz += az * bz;
+                      }
+                      double[][] n = new double[4][4];
+                      n[0][0] = sxx + syy + szz;
+                      n[0][1] = n[1][0] = syz - szy;
+                      n[0][2] = n[2][0] = szx - sxz;
+                      n[0][3] = n[3][0] = sxy - syx;
+                      n[1][1] = sxx - syy - szz;
+                      n[1][2] = n[2][1] = sxy + syx;
+                      n[1][3] = n[3][1] = szx + sxz;
+                      n[2][2] = -sxx + syy - szz;
+                      n[2][3] = n[3][2] = syz + szy;
+                      n[3][3] = -sxx - syy + szz;
+
+                      double[][] eigenvectors = new double[4][4];
+                      for (int i = 0; i < 4; i++) eigenvectors[i][i] = 1.0;
+                      for (int iteration = 0; iteration < 40; iteration++) {
+                          int p = 0, q = 1;
+                          double largest = Math.abs(n[p][q]);
+                          for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
+                              double value = Math.abs(n[i][j]);
+                              if (value > largest) { largest = value; p = i; q = j; }
+                          }
+                          if (largest < 1e-10) break;
+                          double theta = 0.5 * Math.atan2(2.0 * n[p][q], n[q][q] - n[p][p]);
+                          double c = Math.cos(theta), s = Math.sin(theta);
+                          double app = n[p][p], aqq = n[q][q], apq = n[p][q];
+                          n[p][p] = c * c * app - 2 * s * c * apq + s * s * aqq;
+                          n[q][q] = s * s * app + 2 * s * c * apq + c * c * aqq;
+                          n[p][q] = n[q][p] = 0.0;
+                          for (int k = 0; k < 4; k++) {
+                              if (k == p || k == q) continue;
+                              double akp = n[k][p], akq = n[k][q];
+                              n[k][p] = n[p][k] = c * akp - s * akq;
+                              n[k][q] = n[q][k] = s * akp + c * akq;
+                          }
+                          for (int k = 0; k < 4; k++) {
+                              double vkp = eigenvectors[k][p], vkq = eigenvectors[k][q];
+                              eigenvectors[k][p] = c * vkp - s * vkq;
+                              eigenvectors[k][q] = s * vkp + c * vkq;
+                          }
+                      }
+                      int best = 0;
+                      for (int i = 1; i < 4; i++) if (n[i][i] > n[best][best]) best = i;
+                      double qw = eigenvectors[0][best], qx = eigenvectors[1][best];
+                      double qy = eigenvectors[2][best], qz = eigenvectors[3][best];
+                      double norm = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+                      if (norm < 1e-12) return false;
+                      qw /= norm; qx /= norm; qy /= norm; qz /= norm;
+                      outR[0] = (float) (1 - 2 * (qy * qy + qz * qz));
+                      outR[1] = (float) (2 * (qx * qy - qz * qw));
+                      outR[2] = (float) (2 * (qx * qz + qy * qw));
+                      outR[3] = (float) (2 * (qx * qy + qz * qw));
+                      outR[4] = (float) (1 - 2 * (qx * qx + qz * qz));
+                      outR[5] = (float) (2 * (qy * qz - qx * qw));
+                      outR[6] = (float) (2 * (qx * qz - qy * qw));
+                      outR[7] = (float) (2 * (qy * qz + qx * qw));
+                      outR[8] = (float) (1 - 2 * (qx * qx + qy * qy));
+                      outT[0] = (float) (tx - (outR[0] * sx + outR[1] * sy + outR[2] * sz));
+                      outT[1] = (float) (ty - (outR[3] * sx + outR[4] * sy + outR[5] * sz));
+                      outT[2] = (float) (tz - (outR[6] * sx + outR[7] * sy + outR[8] * sz));
+                      return true;
+                  }
+
+                  private static float[] identity3() { return new float[]{1,0,0, 0,1,0, 0,0,1}; }
+                  private static float[] multiply3(float[] a, float[] b) {
+                      float[] r = new float[9];
+                      for (int row = 0; row < 3; row++) for (int col = 0; col < 3; col++)
+                          r[row * 3 + col] = a[row * 3] * b[col] + a[row * 3 + 1] * b[3 + col]
+                                  + a[row * 3 + 2] * b[6 + col];
+                      return r;
+                  }
+                  private static float[] multiplyVector(float[] r, float[] v) {
+                      return new float[]{r[0]*v[0]+r[1]*v[1]+r[2]*v[2],
+                              r[3]*v[0]+r[4]*v[1]+r[5]*v[2],
+                              r[6]*v[0]+r[7]*v[1]+r[8]*v[2]};
+                  }
+                  private static float length(float x, float y, float z) {
+                      return (float) Math.sqrt(x*x + y*y + z*z);
+                  }
+                  private static float rotationAngle(float[] r) {
+                      float c = Math.max(-1.0f, Math.min(1.0f, (r[0] + r[4] + r[8] - 1.0f) * 0.5f));
+                      return (float) Math.acos(c);
+                  }
+              }
+              ''').lstrip())
+
+          # 2) Let GLPointsFrame display a persistent fused cloud, using reusable direct GL buffers.
+          points_view = points_view_file.read_text()
+          points_view = replace_once(points_view,
+              "import java.nio.ByteOrder;\nimport java.nio.IntBuffer;",
+              "import java.nio.ByteOrder;\nimport java.nio.IntBuffer;\nimport java.nio.FloatBuffer;",
+              "GLPointsFrame FloatBuffer import")
+          points_view = replace_once(points_view,
+              "    private IntBuffer mGlTexture;",
+              "    private IntBuffer mGlTexture;\n"
+              "    private FloatBuffer mAccumulatedVertices;\n"
+              "    private ByteBuffer mAccumulatedColors;\n"
+              "    private int mAccumulatedCount = 0;\n"
+              "    private float mCloudCenterX = 0f, mCloudCenterY = 0f, mCloudMinZ = 0f, mCloudScale = 1f;",
+              "GLPointsFrame accumulated buffer fields")
+          points_view = replace_once(points_view,
+              "    public int getTexture() { return mGlTexture.array()[0]; }",
+              "    public int getTexture() { return mGlTexture.array()[0]; }\n\n"
+              "    public synchronized Frame cloneTextureFrame() {\n"
+              "        return mTexture == null ? null : mTexture.clone();\n"
+              "    }\n\n"
+              "    public byte[] createTexture(Points points, VideoFrame vf) {\n"
+              "        if (vf == null) return createTexture(points.getVertices(), 1.2f);\n"
+              "        int w = vf.getWidth(), h = vf.getHeight();\n"
+              "        int pointCount = points.getCount();\n"
+              "        byte[] textureData = new byte[w * h * 3];\n"
+              "        byte[] texture = new byte[pointCount * 4];\n"
+              "        float[] xyz = points.getVertices();\n"
+              "        float[] uv = points.getTextureCoordinates();\n"
+              "        vf.getData(textureData);\n"
+              "        for (int i = 0; i < pointCount; i++) {\n"
+              "            if (xyz[i * 3 + 2] == 0) continue;\n"
+              "            int x = Math.round(uv[i * 2] * w);\n"
+              "            int y = Math.round(uv[i * 2 + 1] * h);\n"
+              "            if (x < 0 || y < 0 || x >= w || y >= h) continue;\n"
+              "            int p = (x + y * w) * 3;\n"
+              "            texture[i * 4] = textureData[p];\n"
+              "            texture[i * 4 + 1] = textureData[p + 1];\n"
+              "            texture[i * 4 + 2] = textureData[p + 2];\n"
+              "            texture[i * 4 + 3] = (byte) 255;\n"
+              "        }\n"
+              "        return texture;\n"
+              "    }\n\n"
+              "    public synchronized void setAccumulatedCloud(float[] vertices, byte[] colors) {\n"
+              "        if (vertices == null || vertices.length < 3) { mAccumulatedCount = 0; return; }\n"
+              "        int vertexCount = vertices.length / 3;\n"
+              "        if (mAccumulatedVertices == null || mAccumulatedVertices.capacity() < vertices.length) {\n"
+              "            int capacity = Math.max(vertices.length, mAccumulatedVertices == null ? 4096 : mAccumulatedVertices.capacity() * 2);\n"
+              "            mAccumulatedVertices = ByteBuffer.allocateDirect(capacity * 4)\n"
+              "                    .order(ByteOrder.nativeOrder()).asFloatBuffer();\n"
+              "        }\n"
+              "        mAccumulatedVertices.clear();\n"
+              "        mAccumulatedVertices.put(vertices, 0, vertices.length);\n"
+              "        mAccumulatedVertices.position(0);\n"
+              "        if (colors != null && colors.length >= vertexCount * 4) {\n"
+              "            if (mAccumulatedColors == null || mAccumulatedColors.capacity() < vertexCount * 4) {\n"
+              "                int capacity = Math.max(vertexCount * 4, mAccumulatedColors == null ? 16384 : mAccumulatedColors.capacity() * 2);\n"
+              "                mAccumulatedColors = ByteBuffer.allocateDirect(capacity).order(ByteOrder.nativeOrder());\n"
+              "            }\n"
+              "            mAccumulatedColors.clear();\n"
+              "            mAccumulatedColors.put(colors, 0, vertexCount * 4);\n"
+              "            mAccumulatedColors.position(0);\n"
+              "        } else { mAccumulatedColors = null; }\n"
+              "        float minX = Float.POSITIVE_INFINITY, maxX = Float.NEGATIVE_INFINITY;\n"
+              "        float minY = Float.POSITIVE_INFINITY, maxY = Float.NEGATIVE_INFINITY;\n"
+              "        float minZ = Float.POSITIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;\n"
+              "        for (int i = 0; i < vertices.length; i += 3) {\n"
+              "            minX = Math.min(minX, vertices[i]); maxX = Math.max(maxX, vertices[i]);\n"
+              "            minY = Math.min(minY, vertices[i + 1]); maxY = Math.max(maxY, vertices[i + 1]);\n"
+              "            minZ = Math.min(minZ, vertices[i + 2]); maxZ = Math.max(maxZ, vertices[i + 2]);\n"
+              "        }\n"
+              "        mCloudCenterX = (minX + maxX) * 0.5f;\n"
+              "        mCloudCenterY = (minY + maxY) * 0.5f;\n"
+              "        mCloudMinZ = minZ;\n"
+              "        float extent = Math.max(maxX - minX, Math.max(maxY - minY, maxZ - minZ));\n"
+              "        mCloudScale = extent > 1.8f ? 1.8f / extent : 1f;\n"
+              "        mAccumulatedCount = vertexCount;\n"
+              "    }",
+              "GLPointsFrame setAccumulatedCloud")
+          start = points_view.index("    @Override\n    public synchronized void draw(Rect rect)")
+          end = points_view.index("    //fallback to gray scale", start)
+          new_draw = '''    @Override
+              public synchronized void draw(Rect rect)
+              {
+                  if (mAccumulatedCount > 0 && mAccumulatedVertices != null) {
+                      drawAccumulated(rect);
+                      return;
+                  }
+                  if (mFrame == null || !(mFrame.is(Extension.POINTS)))
+                      return;
+
+                  setViewport(rect);
+                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
+                  GLES10.glPushMatrix();
+                  GLES10.glLoadIdentity();
+                  GLES10.glOrthof(1f, -1f, -1f, 1f, -7f, 0f);
+                  GLES10.glRotatef(180, 0.0f, 0.0f, 1.0f);
+                  GLES10.glRotatef(-mDeltaY * mRotationFactor, 1.0f, 0.0f, 0.0f);
+                  GLES10.glRotatef(mDeltaX * mRotationFactor, 0.0f, 1.0f, 0.0f);
+                  Points points = mFrame.as(Extension.POINTS);
+                  float[] data = points.getVertices();
+                  byte[] tex = mTexture == null ? createTexture(data, 1.2f) : createTexture(points);
+                  drawPoints(data, tex);
+                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
+                  GLES10.glPopMatrix();
+              }
+
+              private void drawAccumulated(Rect rect) {
+                  setViewport(rect);
+                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
+                  GLES10.glPushMatrix();
+                  GLES10.glLoadIdentity();
+                  GLES10.glOrthof(1f, -1f, -1f, 1f, -7f, 0f);
+                  GLES10.glRotatef(180, 0.0f, 0.0f, 1.0f);
+                  GLES10.glRotatef(-mDeltaY * mRotationFactor, 1.0f, 0.0f, 0.0f);
+                  GLES10.glRotatef(mDeltaX * mRotationFactor, 0.0f, 1.0f, 0.0f);
+                  GLES10.glScalef(mCloudScale, mCloudScale, mCloudScale);
+                  GLES10.glTranslatef(-mCloudCenterX, -mCloudCenterY, -mCloudMinZ);
+
+                  if (mAccumulatedColors != null) {
+                      GLES10.glEnableClientState(GLES10.GL_COLOR_ARRAY);
+                      mAccumulatedColors.position(0);
+                      GLES10.glColorPointer(4, GLES10.GL_UNSIGNED_BYTE, 0, mAccumulatedColors);
+                  }
+                  GLES10.glEnableClientState(GLES10.GL_VERTEX_ARRAY);
+                  mAccumulatedVertices.position(0);
+                  GLES10.glVertexPointer(3, GLES10.GL_FLOAT, 0, mAccumulatedVertices);
+                  GLES10.glPointSize(2.0f);
+                  GLES10.glDrawArrays(GLES10.GL_POINTS, 0, mAccumulatedCount);
+                  GLES10.glDisableClientState(GLES10.GL_VERTEX_ARRAY);
+                  if (mAccumulatedColors != null) GLES10.glDisableClientState(GLES10.GL_COLOR_ARRAY);
+
+                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
+                  GLES10.glPopMatrix();
+              }
+
+          '''
+          points_view = points_view[:start] + new_draw + points_view[end:]
+          points_view = replace_once(points_view,
+              "        mGlTexture = null;\n    }",
+              "        mGlTexture = null;\n"
+              "        mAccumulatedVertices = null;\n"
+              "        mAccumulatedColors = null;\n"
+              "        mAccumulatedCount = 0;\n"
+              "    }",
+              "GLPointsFrame close cloud buffers")
+          points_view_file.write_text(points_view)
+
+          # 3) Feed each colourized point frame into the fusion engine and expose controls.
+          renderer = renderer_file.read_text()
+          renderer = replace_once(renderer,
+              "import java.util.ArrayList;",
+              "import java.io.File;\n"
+              "import java.io.IOException;\n"
+              "import java.util.ArrayList;\n"
+              "import java.util.concurrent.ExecutorService;\n"
+              "import java.util.concurrent.Executors;\n"
+              "import java.util.concurrent.RejectedExecutionException;\n"
+              "import java.util.concurrent.atomic.AtomicBoolean;",
+              "GLRenderer IO imports")
+          renderer = replace_once(renderer,
+              "    private boolean mShowPoints = false;",
+              "    private boolean mShowPoints = false;\n"
+              "    private final PointCloudFusion mScanFusion = new PointCloudFusion();\n"
+              "    private final ExecutorService mFusionExecutor = Executors.newSingleThreadExecutor();\n"
+              "    private final AtomicBoolean mFusionQueued = new AtomicBoolean(false);\n"
+              "    private volatile boolean mScanActive = false;\n"
+              "    private volatile int mScanGeneration = 0;",
+              "GLRenderer scan fields")
+          renderer = replace_once(renderer,
+              "            if(mPointsTexture != null && curr instanceof GLPointsFrame){\n"
+              "                ((GLPointsFrame) curr).setTextureFrame(mPointsTexture);\n"
+              "                mPointsTexture.close();\n"
+              "                mPointsTexture = null;\n"
+              "            }",
+              "            if(mPointsTexture != null && curr instanceof GLPointsFrame){\n"
+              "                ((GLPointsFrame) curr).setTextureFrame(mPointsTexture);\n"
+              "                mPointsTexture.close();\n"
+              "                mPointsTexture = null;\n"
+              "            }\n"
+              "\n"
+              "            if (mScanActive && curr instanceof GLPointsFrame && f.is(Extension.POINTS)\n"
+              "                    && mScanFusion.shouldIntegrateNow()\n"
+              "                    && mFusionQueued.compareAndSet(false, true)) {\n"
+              "                final int generation = mScanGeneration;\n"
+              "                final Frame pointFrame = f.clone();\n"
+              "                final GLPointsFrame pointView = (GLPointsFrame) curr;\n"
+              "                final Frame colorFrame = pointView.cloneTextureFrame();\n"
+              "                try {\n"
+              "                    mFusionExecutor.execute(() -> {\n"
+              "                        try (Frame retainedPoints = pointFrame; Frame retainedColor = colorFrame) {\n"
+              "                            if (!mScanActive || generation != mScanGeneration) return;\n"
+              "                            Points points = retainedPoints.as(Extension.POINTS);\n"
+              "                            VideoFrame color = retainedColor != null && retainedColor.is(Extension.VIDEO_FRAME)\n"
+              "                                    ? retainedColor.as(Extension.VIDEO_FRAME) : null;\n"
+              "                            byte[] colors = pointView.createTexture(points, color);\n"
+              "                            if (mScanFusion.integrate(points.getVertices(), colors, generation)\n"
+              "                                    && generation == mScanGeneration) {\n"
+              "                                PointCloudFusion.Snapshot snapshot = mScanFusion.snapshot();\n"
+              "                                pointView.setAccumulatedCloud(snapshot.vertices, snapshot.colors);\n"
+              "                            }\n"
+              "                        } catch (Exception e) {\n"
+              "                            android.util.Log.e(\"RealSenseScan\", \"Point-cloud fusion failed\", e);\n"
+              "                        } finally {\n"
+              "                            mFusionQueued.set(false);\n"
+              "                        }\n"
+              "                    });\n"
+              "                } catch (RejectedExecutionException e) {\n"
+              "                    pointFrame.close();\n"
+              "                    if (colorFrame != null) colorFrame.close();\n"
+              "                    mFusionQueued.set(false);\n"
+              "                    android.util.Log.e(\"RealSenseScan\", \"Fusion executor rejected task\", e);\n"
+              "                }\n"
+              "            }",
+              "GLRenderer fuse points on upload")
+          renderer = replace_once(renderer,
+              "    public void showPointcloud(boolean showPoints) {",
+              "    public void startScan() {\n"
+              "        synchronized (mFrames) {\n"
+              "            mScanFusion.reset();\n"
+              "            mScanGeneration = mScanFusion.getSessionId();\n"
+              "            mScanActive = true;\n"
+              "        }\n"
+              "    }\n\n"
+              "    public void stopScan() { mScanActive = false; }\n"
+              "    public boolean isScanActive() { return mScanActive; }\n"
+              "    public int getScanPointCount() { return mScanFusion.getPointCount(); }\n"
+              "    public boolean isScanTracking() { return mScanFusion.isTracking(); }\n"
+              "    public void writeScan(File file) throws IOException { mScanFusion.writePly(file); }\n\n"
+              "    public void showPointcloud(boolean showPoints) {",
+              "GLRenderer scan public API")
+          close_anchor = "        if (mYuyDecoder != null) mYuyDecoder.close();"
+          if close_anchor in renderer:
+              renderer = renderer.replace(close_anchor,
+                  close_anchor + "\n        mFusionExecutor.shutdown();", 1)
+          renderer_file.write_text(renderer)
+
+          # 4) Expose the scan API through the existing RealSense SurfaceView.
+          surface = rs_surface_file.read_text()
+          surface = replace_once(surface,
+              "import java.util.Map;",
+              "import java.util.Map;\nimport java.io.File;\nimport java.io.IOException;",
+              "GLRsSurfaceView IO imports")
+          surface = replace_once(surface,
+              "    public void showPointcloud(boolean showPoints) {\n        mRenderer.showPointcloud(showPoints);\n    }",
+              "    public void showPointcloud(boolean showPoints) {\n        mRenderer.showPointcloud(showPoints);\n    }\n\n"
+              "    public void startScan() { mRenderer.startScan(); }\n"
+              "    public void stopScan() { mRenderer.stopScan(); }\n"
+              "    public boolean isScanActive() { return mRenderer.isScanActive(); }\n"
+              "    public int getScanPointCount() { return mRenderer.getScanPointCount(); }\n"
+              "    public boolean isScanTracking() { return mRenderer.isScanTracking(); }\n"
+              "    public void writeScan(File file) throws IOException { mRenderer.writeScan(file); }",
+              "GLRsSurfaceView scan API")
+          rs_surface_file.write_text(surface)
+
+          # 5) Add Scan/Stop controls and a live tracking/point-count indicator to PreviewActivity.
+          activity = activity_file.read_text()
+          activity = replace_once(activity,
+              "        m3dButton.setOnClickListener(new View.OnClickListener() {\n"
+              "            @Override\n"
+              "            public void onClick(View view) {\n"
+              "                mGLSurfaceView.setVisibility(View.GONE);",
+              "        m3dButton.setOnClickListener(new View.OnClickListener() {\n"
+              "            @Override\n"
+              "            public void onClick(View view) {\n"
+              "                if (mScanActive) {\n"
+              "                    Toast.makeText(PreviewActivity.this, \"3D-режим закреплён на время сканирования\", Toast.LENGTH_SHORT).show();\n"
+              "                    return;\n"
+              "                }\n"
+              "                mGLSurfaceView.setVisibility(View.GONE);",
+              "Disable 3D toggle during scan")
+          activity = replace_once(activity,
+              "    private TextView mExportPlyButton;",
+              "    private TextView mExportPlyButton;\n"
+              "    private TextView mScanButton;\n"
+              "    private TextView mScanStatus;\n"
+              "    private boolean mScanActive = false;",
+              "PreviewActivity scan fields")
+          activity = replace_once(activity,
+              "        mExportPlyButton = findViewById(R.id.preview_export_ply_button);",
+              "        mExportPlyButton = findViewById(R.id.preview_export_ply_button);\n"
+              "        mScanButton = findViewById(R.id.preview_scan_button);\n"
+              "        mScanStatus = findViewById(R.id.preview_scan_status);\n"
+              "        mScanButton.setText(mScanActive ? \"STOP\" : \"SCAN\");\n"
+              "        mScanStatus.setVisibility(mScanActive ? View.VISIBLE : View.GONE);",
+              "PreviewActivity scan view binding")
+          activity = replace_once(activity,
+              "        mExportPlyButton.setOnClickListener(new View.OnClickListener() {",
+              "        mScanButton.setOnClickListener(new View.OnClickListener() {\n"
+              "            @Override\n"
+              "            public void onClick(View view) {\n"
+              "                if (!mScanActive) {\n"
+              "                    mGLSurfaceView.clear();\n"
+              "                    mGLSurfaceView.showPointcloud(true);\n"
+              "                    mGLSurfaceView.startScan();\n"
+              "                    mScanActive = true;\n"
+              "                    mShow3D = true;\n"
+              "                    m3dButton.setTextColor(Color.YELLOW);\n"
+              "                    SharedPreferences prefs = getSharedPreferences(getString(R.string.app_settings), Context.MODE_PRIVATE);\n"
+              "                    prefs.edit().putBoolean(getString(R.string.show_3d), true).apply();\n"
+              "                    mScanButton.setText(\"STOP\");\n"
+              "                    mScanStatus.setVisibility(View.VISIBLE);\n"
+              "                    mScanStatus.setText(\"Сканирование: поиск геометрии...\");\n"
+              "                } else {\n"
+              "                    mGLSurfaceView.stopScan();\n"
+              "                    mScanActive = false;\n"
+              "                    mScanButton.setText(\"SCAN\");\n"
+              "                    mScanStatus.setText(\"Остановлено · \" + mGLSurfaceView.getScanPointCount() + \" точек\");\n"
+              "                }\n"
+              "            }\n"
+              "        });\n\n"
+              "        mExportPlyButton.setOnClickListener(new View.OnClickListener() {",
+              "PreviewActivity scan click listener")
+          # Replace existing snapshot-only button handler with a dual fused-map / one-frame exporter.
+          start = activity.index("        mExportPlyButton.setOnClickListener(new View.OnClickListener() {")
+          end = activity.index("        mStatisticsButton.setOnClickListener(new View.OnClickListener() {", start)
+          export_listener = '''        mExportPlyButton.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View view) {
+                          if (!mPlyExportState.compareAndSet(0, 2)) {
+                              Toast.makeText(PreviewActivity.this, "Экспорт уже выполняется", Toast.LENGTH_SHORT).show();
+                              return;
+                          }
+                          final boolean exportFused = mGLSurfaceView.getScanPointCount() > 0;
+                          if (!exportFused && mScanActive) {
+                              mPlyExportState.set(0);
+                              Toast.makeText(PreviewActivity.this,
+                                      "Дождитесь регистрации первых кадров сканирования", Toast.LENGTH_LONG).show();
+                              return;
+                          }
+                          if (!exportFused) mPlyExportState.set(1);
+                          if (exportFused) {
+                              Toast.makeText(PreviewActivity.this, "Сохраняю объединённое облако...", Toast.LENGTH_SHORT).show();
+                              try {
+                                  mPlyExportExecutor.execute(() -> {
+                                      try {
+                                          final String savedLocation = PlySnapshotExporter.exportCloud(
+                                                  PreviewActivity.this, mGLSurfaceView);
+                                          runOnUiThread(() -> Toast.makeText(PreviewActivity.this,
+                                                  "Скан сохранён: " + savedLocation, Toast.LENGTH_LONG).show());
+                                      } catch (Exception e) {
+                                          Log.e(TAG, "Fused PLY export failed", e);
+                                          final String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                                          runOnUiThread(() -> Toast.makeText(PreviewActivity.this,
+                                                  "Ошибка сохранения: " + message, Toast.LENGTH_LONG).show());
+                                      } finally {
+                                          mPlyExportState.set(0);
+                                      }
+                                  });
+                              } catch (RejectedExecutionException e) {
+                                  mPlyExportState.set(0);
+                                  Log.e(TAG, "PLY export executor rejected the task", e);
+                              }
+                          } else {
+                              mPlyExportState.set(1);
+                              Toast.makeText(PreviewActivity.this,
+                                      "Сохраню облако точек со следующего кадра", Toast.LENGTH_SHORT).show();
+                          }
+                      }
+                  });
+
+          '''
+          activity = activity[:start] + export_listener + activity[end:]
+          activity = replace_once(activity,
+              "                mStreamingStats.onFrameset(frameSet);",
+              "                mStreamingStats.onFrameset(frameSet);\n"
+              "                if (mScanActive && mScanStatus != null) {\n"
+              "                    int count = mGLSurfaceView.getScanPointCount();\n"
+              "                    String tracking = mGLSurfaceView.isScanTracking() ? \"tracking OK\" : \"поиск совпадений\";\n"
+              "                    mScanStatus.setText(\"СКАН · \" + count + \" точек · \" + tracking);\n"
+              "                }",
+              "PreviewActivity live scan status")
+          activity_file.write_text(activity)
+
+          # 6) Add a scan HUD to the existing preview layout.
+          layout = layout_file.read_text()
+          layout = replace_once(layout,
+              '    <ScrollView\n',
+              '    <LinearLayout\n'
+              '        android:layout_width="match_parent"\n'
+              '        android:layout_height="wrap_content"\n'
+              '        android:layout_alignParentTop="true"\n'
+              '        android:orientation="horizontal"\n'
+              '        android:gravity="center_vertical"\n'
+              '        android:padding="12dp"\n'
+              '        android:background="#99000000">\n\n'
+              '        <TextView\n'
+              '            android:id="@+id/preview_scan_button"\n'
+              '            android:layout_width="wrap_content"\n'
+              '            android:layout_height="wrap_content"\n'
+              '            android:padding="10dp"\n'
+              '            android:clickable="true"\n'
+              '            android:focusable="true"\n'
+              '            android:text="SCAN"\n'
+              '            android:textColor="#ffffff"\n'
+              '            android:textStyle="bold"\n'
+              '            android:background="#444444" />\n\n'
+              '        <TextView\n'
+              '            android:id="@+id/preview_scan_status"\n'
+              '            android:layout_width="0dp"\n'
+              '            android:layout_height="wrap_content"\n'
+              '            android:layout_weight="1"\n'
+              '            android:paddingStart="12dp"\n'
+              '            android:text="Сканирование не запущено"\n'
+              '            android:textColor="#ffffff"\n'
+              '            android:textSize="12sp"\n'
+              '            android:visibility="gone" />\n'
+              '    </LinearLayout>\n\n'
+              '    <ScrollView\n',
+              "Preview scan HUD layout")
+          layout_file.write_text(layout)
+
+          # 7) Make the existing PLY button export the fused map when one exists.
+          exporter = exporter_file.read_text()
+          exporter = replace_once(exporter,
+              "import com.intel.realsense.librealsense.Extension;",
+              "import com.intel.realsense.librealsense.Extension;\n"
+              "import com.intel.realsense.librealsense.GLRsSurfaceView;",
+              "PLY exporter surface import")
+          exporter = replace_once(exporter,
+              "    private PlySnapshotExporter() { }",
+              "    private PlySnapshotExporter() { }\n\n"
+              "    public static String exportCloud(Context context, GLRsSurfaceView view) throws Exception {\n"
+              "        File documents = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);\n"
+              "        if (documents == null) throw new IOException(\"External app storage is unavailable\");\n"
+              "        File outputDir = new File(documents, \"RealSense3D\");\n"
+              "        if (!outputDir.exists() && !outputDir.mkdirs()) throw new IOException(\"Cannot create scan output directory\");\n"
+              "        String stamp = new SimpleDateFormat(\"yyyyMMdd_HHmmss_SSS\", Locale.US).format(new Date());\n"
+              "        File output = new File(outputDir, \"fused_scan_\" + stamp + \".ply\");\n"
+              "        view.writeScan(output);\n"
+              "        if (!output.isFile() || output.length() == 0) throw new IOException(\"Fused PLY file is empty\");\n"
+              "        return publishToDownloads(context, output);\n"
+              "    }",
+              "PLY exporter fused cloud method")
+          exporter = replace_once(exporter,
+              "    private static String publishToDownloads(Context context, File source) throws Exception {",
+              "    public static String publishToDownloads(Context context, File source) throws Exception {",
+              "PLY exporter publish visibility")
+          exporter_file.write_text(exporter)
+
+          # Bump the app version so Android treats this as the next scanner release.
+          app_gradle = app_gradle_file.read_text()
+          app_gradle = replace_once(app_gradle, "        versionCode 6", "        versionCode 7", "app version code")
+          app_gradle = replace_once(app_gradle, '        versionName "0.0.6"', '        versionName "0.0.7"', "app version name")
+          app_gradle_file.write_text(app_gradle)
+
+          print("Live point-cloud scan fusion patch applied")
+          PY
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build RealSense 3D Studio
+        working-directory: source/wrappers/android
+        shell: bash
+        run: |
+          gradle :tools:camera:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RealSense-3D-Studio-APK
+          path: source/wrappers/android/tools/camera/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
