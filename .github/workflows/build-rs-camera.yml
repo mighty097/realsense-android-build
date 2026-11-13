@@ -1,0 +1,87 @@
+
+name: Build RS Camera APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out build repository
+        uses: actions/checkout@v7
+
+      - name: Download official RealSense source
+        run: |
+          git clone --depth 1 --branch v2.59.1 https://github.com/realsenseai/librealsense.git source
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android build components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build RS Camera APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source/wrappers/android
+          chmod +x ./gradlew
+
+          echo "Gradle projects in the official Android wrapper:"
+          PROJECTS_OUTPUT="$(./gradlew projects --console=plain)"
+          printf '%s\n' "$PROJECTS_OUTPUT"
+
+          CAMERA_PROJECT="$(printf '%s\n' "$PROJECTS_OUTPUT" \
+            | sed -n "s/.*Project '\([^']*camera[^']*\)'.*/\1/p" \
+            | head -n 1)"
+
+          if [ -z "$CAMERA_PROJECT" ]; then
+            echo "ERROR: Could not identify the RS Camera Gradle project."
+            exit 1
+          fi
+
+          echo "Building Gradle project: ${CAMERA_PROJECT}"
+          ./gradlew "${CAMERA_PROJECT}:assembleDebug" --no-daemon --stacktrace
+
+          mkdir -p "$GITHUB_WORKSPACE/packaged-apk"
+          find . -type f -path '*/build/outputs/apk/debug/*.apk' \
+            -exec cp -v {} "$GITHUB_WORKSPACE/packaged-apk/" \;
+
+          if ! find "$GITHUB_WORKSPACE/packaged-apk" -maxdepth 1 -type f -name '*.apk' | grep -q .; then
+            echo "ERROR: Build completed but no debug APK was found."
+            exit 1
+          fi
+
+          echo "APK files created:"
+          ls -lh "$GITHUB_WORKSPACE/packaged-apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RS-Camera-debug-APK
+          path: packaged-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14
