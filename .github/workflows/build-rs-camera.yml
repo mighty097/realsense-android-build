@@ -1,131 +1,22 @@
-
-name: Build RS Camera APK
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build RealSense Camera
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Download RealSense SDK
-        run: |
-          git clone --depth 1 --branch v2.59.1 \
-            https://github.com/realsenseai/librealsense.git source
-
-      - name: Setup Java 17
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Install Android components
-        run: |
-          sdkmanager --install \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "ndk;28.0.13004108" \
-            "cmake;3.22.1"
-
-      - name: Setup Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.11.1'
-
-      
-      - name: Patch Option.java and configure ARM64
+      - name: Fix Option.java enum syntax
         shell: bash
         run: |
-          set -euo pipefail
-
-          FILE="source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java"
-
-          echo "Checking problematic enum declaration:"
-          grep -n -B 8 -A 5 "OPTION_RGB_TNR_ENABLED" "$FILE"
-
-          echo "Checking upstream fix availability..."
-          git -C source log -1 --format="%H %s"
-
-          echo "Applying temporary syntax correction"
-
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path("source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java")
-          s = p.read_text()
+          file = Path(
+              "source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java"
+          )
 
-          old = "OPTION_RGB_TNR_ENABLED(97);"
-          new = "OPTION_RGB_TNR_ENABLED(97)"
+          content = file.read_text()
+          old = "OPTION_SAFETY_MODE(96);"
+          new = "OPTION_SAFETY_MODE(96),"
 
-          if s.count(old) != 1:
-              raise SystemExit("Unexpected Option.java structure; refusing automatic patch")
+          if content.count(old) != 1:
+              raise SystemExit(
+                  f"Expected one occurrence of {old}, found {content.count(old)}"
+              )
 
-          s = s.replace(old, new, 1)
-          p.write_text(s)
-
-          print("Patch applied.")
+          file.write_text(content.replace(old, new, 1))
+          print("Option.java syntax fixed successfully")
           PY
-
-          FILE="source/wrappers/android/librealsense/build.gradle"
-
-          sed -i \
-            "s/abiFilters 'arm64-v8a', 'x86_64'/abiFilters 'arm64-v8a'/" \
-            "$FILE"
-
-          echo "Patch verification:"
-          grep -n -B 3 -A 3 "OPTION_RGB_TNR_ENABLED" \
-            source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java
-
-
-      - name: Verify Gradle project
-        run: |
-          cd source/wrappers/android
-          gradle --version
-          gradle projects --console=plain
-
-      - name: Compile RS Camera
-        run: |
-          cd source/wrappers/android
-
-          gradle :tools:camera:assembleDebug \
-            --no-daemon \
-            --stacktrace \
-            --max-workers=2
-
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APK="source/wrappers/android/tools/camera/build/outputs/apk/debug/camera-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "APK not found. Available APK files:"
-            find source -type f -name '*.apk'
-            exit 1
-          fi
-
-          mkdir -p packaged-apk
-          cp "$APK" packaged-apk/RS-Camera-arm64-debug.apk
-
-          ls -lh packaged-apk/
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: RS-Camera-ARM64
-          path: packaged-apk/*.apk
-          if-no-files-found: error
-          retention-days: 14
