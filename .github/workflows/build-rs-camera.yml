@@ -1,5 +1,5 @@
 
-name: Build RS Camera APK
+name: Inspect RS Camera Project
 
 on:
   workflow_dispatch:
@@ -8,123 +8,69 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build Android APK
+  inspect:
+    name: Inspect Android Gradle configuration
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
 
     steps:
-      - name: Check out build repository
-        uses: actions/checkout@v7
-
-      - name: Download official RealSense source
+      - name: Download RealSense source
         run: |
           git clone --depth 1 --branch v2.59.1 \
             https://github.com/realsenseai/librealsense.git source
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Install Android build components
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "ndk;28.0.13004108" \
-            "cmake;3.22.1"
-
-      - name: Read Gradle version
-        id: read-gradle
+      - name: Print Gradle configuration
         shell: bash
         run: |
           set -euo pipefail
-
-          FILE="source/wrappers/android/gradle/wrapper/gradle-wrapper.properties"
-
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: Gradle properties file not found."
-            find source/wrappers/android -maxdepth 4 -type f
-            exit 1
-          fi
-
-          URL=$(grep '^distributionUrl=' "$FILE" | head -n 1 | cut -d= -f2-)
-          URL=$(printf '%s' "$URL" | sed 's/\\:/:/g')
-
-          VERSION=$(printf '%s' "$URL" | \
-            sed -E 's#.*gradle-([0-9]+(\.[0-9]+)*)(-(all|bin))?\.zip#\1#')
-
-          if [ -z "$VERSION" ] || [ "$VERSION" = "$URL" ]; then
-            echo "ERROR: Could not determine Gradle version."
-            cat "$FILE"
-            exit 1
-          fi
-
-          echo "Detected Gradle version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '${{ steps.read-gradle.outputs.version }}'
-          validate-wrappers: false
-
-      - name: Build RS Camera APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
           cd source/wrappers/android
 
-          echo "Gradle version:"
-          gradle --version
+          for FILE in \
+            settings.gradle \
+            build.gradle \
+            gradle.properties \
+            tools/camera/build.gradle \
+            librealsense/build.gradle \
+            readme.md
+          do
+            echo ""
+            echo "=========================================="
+            echo "FILE: $FILE"
+            echo "=========================================="
 
-          echo "Available Gradle projects:"
-          PROJECTS_OUTPUT="$(gradle projects --console=plain)"
-          printf '%s\n' "$PROJECTS_OUTPUT"
+            if [ -f "$FILE" ]; then
+              sed -n '1,240p' "$FILE"
+            else
+              echo "FILE NOT FOUND"
+            fi
+          done
 
-          CAMERA_PROJECT="$(printf '%s\n' "$PROJECTS_OUTPUT" \
-            | sed -n "s/.*Project '\([^']*camera[^']*\)'.*/\1/p" \
-            | head -n 1)"
+          echo ""
+          echo "=========================================="
+          echo "GRADLE WRAPPER FILES"
+          echo "=========================================="
 
-          if [ -z "$CAMERA_PROJECT" ]; then
-            echo "ERROR: Camera Gradle project not found."
-            echo "Available project files:"
-            find . -maxdepth 4 \
-              \( -name 'build.gradle' -o -name 'build.gradle.kts' \
-              -o -name 'settings.gradle' -o -name 'settings.gradle.kts' \)
-            exit 1
-          fi
+          find . -path '*/gradle/wrapper/*' \
+            -type f -print
 
-          echo "Building: $CAMERA_PROJECT"
+          echo ""
+          echo "=========================================="
+          echo "ANDROID MODULE STRUCTURE"
+          echo "=========================================="
 
-          gradle "${CAMERA_PROJECT}:assembleDebug" \
-            --no-daemon --stacktrace
+          find tools/camera -maxdepth 5 \
+            -type f | sort | head -150
 
-          mkdir -p "$GITHUB_WORKSPACE/packaged-apk"
+          echo ""
+          echo "=========================================="
+          echo "PLUGIN VERSION DECLARATIONS"
+          echo "=========================================="
 
-          find . -type f -path '*/build/outputs/apk/debug/*.apk' \
-            -exec cp -v {} "$GITHUB_WORKSPACE/packaged-apk/" \;
+          grep -RInE \
+            'com.android.tools.build:gradle|com.android.application.*version|com.android.library.*version|distributionUrl' \
+            . \
+            --include='*.gradle' \
+            --include='*.gradle.kts' \
+            --include='*.properties' || true
 
-          if ! find "$GITHUB_WORKSPACE/packaged-apk" \
-            -maxdepth 1 -name '*.apk' | grep -q .; then
-            echo "ERROR: No APK generated."
-            exit 1
-          fi
-
-          ls -lh "$GITHUB_WORKSPACE/packaged-apk"
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: RS-Camera-debug-APK
-          path: packaged-apk/*.apk
-          if-no-files-found: error
-          retention-days: 14
+          echo ""
+          echo "DIAGNOSTICS COMPLETED"
