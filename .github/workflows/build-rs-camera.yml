@@ -1,9 +1,8 @@
-name: Build RealSense 3D Studio APK
+name: Build RealSense 3D Scanner APK
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -11,1301 +10,321 @@ permissions:
 
 jobs:
   build:
-    name: Build RealSense 3D Studio
+    name: Build standalone RealSense 3D Scanner
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
-
+    timeout-minutes: 75
     steps:
-      # Download the pinned Intel RealSense source tree.
-      - name: Checkout librealsense
+      - name: Checkout librealsense v2.59.1
         uses: actions/checkout@v4
         with:
           repository: realsenseai/librealsense
           ref: v2.59.1
           path: source
 
-      # Fix the enum delimiter defect in the pinned Android wrapper source.
-      - name: Fix Option.java enum syntax
+      - name: Fix Option.java enum syntax in pinned SDK
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
-          file = Path(
-              "source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java"
-          )
-          if not file.exists():
-              raise SystemExit(f"File not found: {file}")
-
-          content = file.read_text()
+          p = Path("source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense/Option.java")
+          s = p.read_text()
           old = "OPTION_SAFETY_MODE(96);"
-          new = "OPTION_SAFETY_MODE(96),"
-          count = content.count(old)
-          if count != 1:
-              raise SystemExit(f"Expected one occurrence of {old!r}, found {count}")
-
-          file.write_text(content.replace(old, new, 1))
-          print("Option.java enum syntax fixed")
+          if s.count(old) != 1:
+              raise SystemExit(f"Expected one occurrence of {old!r}; found {s.count(old)}")
+          p.write_text(s.replace(old, "OPTION_SAFETY_MODE(96),", 1))
+          print("Fixed the pinned SDK enum delimiter")
           PY
 
-      # Add a PLY snapshot export button to the existing RS Camera preview.
-      # Retains single-frame PLY capture as a fallback when no fused scan exists.
-      - name: Add local PLY snapshot export
+      - name: Inject standalone scanner source
         shell: bash
         run: |
           python3 - <<'PY'
+          import base64
+          import io
+          import shutil
+          import zipfile
           from pathlib import Path
-          from textwrap import dedent, indent
 
-          app = Path("source/wrappers/android/tools/camera")
-          java_dir = app / "src/main/java/com/intel/realsense/camera"
-          layout_dir = app / "src/main/res/layout"
-          activity_file = java_dir / "PreviewActivity.java"
-          layout_file = layout_dir / "activity_preview.xml"
-
-          if not activity_file.exists() or not layout_file.exists():
-              raise SystemExit("Expected RealSense Camera preview sources were not found")
-
-          def replace_once(content: str, old: str, new: str, label: str) -> str:
-              count = content.count(old)
-              if count != 1:
-                  raise SystemExit(f"Patch anchor {label!r}: expected 1 match, found {count}")
-              return content.replace(old, new, 1)
-
-          activity = activity_file.read_text()
-          activity = replace_once(
-              activity,
-              "import java.util.HashMap;\nimport java.util.Map;",
-              "import java.util.HashMap;\nimport java.util.Map;\n"
-              "import java.util.concurrent.ExecutorService;\n"
-              "import java.util.concurrent.Executors;\n"
-              "import java.util.concurrent.RejectedExecutionException;\n"
-              "import java.util.concurrent.atomic.AtomicInteger;",
-              "Java imports",
+          encoded = (
+            "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"
+            "lbRF1PIp/SVVVdwoWS+oFRSLf/lshEaiCUD+S1ZpTIwPxsNVJCJPzpgf2JwDqdzFwLVhRvDAFnatitW4/sxajw0TYHpRzv6q7uwu"
+            "sIrqb05pp9kjF13vRRPu4mJCz38CP/L2q7SK461rQw9/7cApOrSAYo2miVPHEnEcj6DNY304nRFsxgO3Pg9c1i29BzDWw8L2fgjr"
+            "G2uN2xsqytQB+QtEceJoiPKZRW1ETWPii1iKIiKPamYE2h85HzTa8XMSbphaovkXPJyNJpit+gHpY/Tj+HRs3CqFbtIGfNx+k7ex"
+            "0I/cekLIUa0x7zelMA1dCscDtbSHVDzl2zXRMDe+jdxyfKoDa7ZG333/f4v8gzk4ccv0p3HDYu/uyOFNnf0GUEsDBBQAAAAIACIz"
+            "cl3KKN0UgQIAAEoIAAAkAAAAYXBwL3NyYy9tYWluL2NwcC9zY2FuX2Z1c2lvbl9qbmkuY3BwvVXfb9owEH7PX3GlUuUgQEx9mNbS"
+            "TIy1UyvEKrqHvUVWciVBwUa2k46t+993dn4QttKtYlte4Bzf3fd999k5TkWU5THCaCnSQRJ4x83CCldSbVorHR1xEd7nOpUijKTC"
+            "QdLxPArFApQ+jc/O7mjDlXs/odfnnodfDCoBnUkHbmbXl59vP84/wTKTlEHxZDydeje84FRtFa7SRWI2wzevQ4U80yg0nsbhtuSM"
+            "m7TAULifCe0xyGxRUXR7sIwyrrUP3zygR6HJqa3CVFD/NYVhxLUZuc4BE/gAu1CZ75973/fgLWQaHwj3PWqj5OZnvL1Ki4SLOMMa"
+            "fYwZGvwV/S7kbsCqtP3Il1ThQOTXhGGhrNYOm30qEoCieJoIRfeZ5GasFN9AgcqkEdo9Fs5DGpuk+p+ghVLz5rmRXbDGgouXsLe5"
+            "6T2wI5f6+AhHdUsbuH4wuoChjcqOLvRrm/RflTUiKbSBpU6/ImQoFpR2YUn2gw9Ycpm6VVaXr3qXZLsQc8NbGVeNBJcZrlAYzbZS"
+            "iDzL1ka10dv0PZisVgp1nhmqb1n2g7SZi83rgTY0rqiUShs6i5ZGaAJWMvF7tfCV5mV5h3VOfuMan8VbNqHJh+N35KwqvTlnFtoz"
+            "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"
+            "AAAAAAAAAAAAAACkgeMEAABhcHAvc3JjL21haW4vY3BwL3NjYW5fZnVzaW9uX2NvcmUuY3BwUEsBAhQDFAAAAAgAIjNyXYL4lwUd"
+            "AwAAKggAACMAAAAAAAAAAAAAAKSBURQAAGFwcC9zcmMvbWFpbi9jcHAvc2Nhbl9mdXNpb25fY29yZS5oUEsBAhQDFAAAAAgAIjNy"
+            "Xcoo3RSBAgAASggAACQAAAAAAAAAAAAAAKSBrxcAAGFwcC9zcmMvbWFpbi9jcHAvc2Nhbl9mdXNpb25fam5pLmNwcFBLAQIUAxQA"
+            "AAAIAE0zcl3hjxPaRAAAAFMAAAAjAAAAAAAAAAAAAACkgXIaAABhcHAvc3JjL21haW4vcmVzL3ZhbHVlcy9zdHJpbmdzLnhtbFBL"
+            "AQIUAxQAAAAIAJszcl29PVNIoQAAAF0BAAAiAAAAAAAAAAAAAACkgfcaAABhcHAvc3JjL21haW4vcmVzL3ZhbHVlcy9zdHlsZXMu"
+            "eG1sUEsBAhQDFAAAAAgAMzNyXX6js22YBQAAnhAAADwAAAAAAAAAAAAAAKSB2BsAAGFwcC9zcmMvbWFpbi9qYXZhL2NvbS9taWdo"
+            "dHkwOTcvcmVhbHNlbnNlM2QvUGx5RXhwb3J0ZXIuamF2YVBLAQIUAxQAAAAIANczcl3Ny8c72BAAAKxLAAA9AAAAAAAAAAAAAACk"
+            "gcohAABhcHAvc3JjL21haW4vamF2YS9jb20vbWlnaHR5MDk3L3JlYWxzZW5zZTNkL1NjYW5BY3Rpdml0eS5qYXZhUEsBAhQDFAAA"
+            "AAgAZDNyXQNpTCWvCgAAZigAAEIAAAAAAAAAAAAAAKSB/TIAAGFwcC9zcmMvbWFpbi9qYXZhL2NvbS9taWdodHkwOTcvcmVhbHNl"
+            "bnNlM2QvU2NhbkdMU3VyZmFjZVZpZXcuamF2YVBLAQIUAxQAAAAIADMzcl3ufsc2PwIAAJsGAABBAAAAAAAAAAAAAACkgQw+AABh"
+            "cHAvc3JjL21haW4vamF2YS9jb20vbWlnaHR5MDk3L3JlYWxzZW5zZTNkL1NjYW5GdXNpb25OYXRpdmUuamF2YVBLAQIUAxQAAAAI"
+            "AIwzcl1t+i4ZCQUAAFYOAAAfAAAAAAAAAAAAAACkgapAAAB0ZXN0cy9zY2FuX2Z1c2lvbl9ob3N0X3Rlc3QuY3BwUEsFBgAAAAAN"
+            "AA0AcQQAAPBFAAAAAA=="
           )
-          activity = replace_once(
-              activity,
-              "    private TextView mControlsButton;",
-              "    private TextView mControlsButton;\n"
-              "    private TextView mExportPlyButton;\n"
-              "\n"
-              "    // 0 = idle, 1 = waiting for the next frame, 2 = exporting.\n"
-              "    private final AtomicInteger mPlyExportState = new AtomicInteger(0);\n"
-              "    private final ExecutorService mPlyExportExecutor = Executors.newSingleThreadExecutor();",
-              "PLY export fields",
-          )
-          activity = replace_once(
-              activity,
-              "        mControlsButton = findViewById(R.id.controls_button);",
-              "        mControlsButton = findViewById(R.id.controls_button);\n"
-              "        mExportPlyButton = findViewById(R.id.preview_export_ply_button);",
-              "PLY button binding",
-          )
-          activity = replace_once(
-              activity,
-              "        mStatisticsButton.setOnClickListener(new View.OnClickListener() {",
-              indent(dedent("""\
-                      mExportPlyButton.setOnClickListener(new View.OnClickListener() {
-                          @Override
-                          public void onClick(View view) {
-                              if (mPlyExportState.compareAndSet(0, 1)) {
-                                  Toast.makeText(PreviewActivity.this,
-                                          "Сохраню облако точек со следующего кадра", Toast.LENGTH_SHORT).show();
-                              } else {
-                                  Toast.makeText(PreviewActivity.this,
-                                          "Экспорт уже выполняется", Toast.LENGTH_SHORT).show();
-                              }
-                          }
-                      });
+          bundle = Path("/tmp/rs3d_bundle")
+          bundle.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(io.BytesIO(base64.b64decode(encoded))) as archive:
+              archive.extractall(bundle)
 
-              """), "        ") + "        mStatisticsButton.setOnClickListener(new View.OnClickListener() {",
-              "PLY button listener",
-          )
-          activity = replace_once(
-              activity,
-              "                mStreamingStats.onFrameset(frameSet);",
-              indent(dedent("""\
-                              mStreamingStats.onFrameset(frameSet);
-                              if (mPlyExportState.compareAndSet(1, 2)) {
-                                  final FrameSet snapshot = frameSet.clone();
-                                  try {
-                                      mPlyExportExecutor.execute(() -> {
-                                          try {
-                                              final String savedLocation = PlySnapshotExporter.export(
-                                                      PreviewActivity.this, snapshot);
-                                              runOnUiThread(() -> Toast.makeText(
-                                                      PreviewActivity.this,
-                                                      "PLY сохранён: " + savedLocation,
-                                                      Toast.LENGTH_LONG).show());
-                                          } catch (Exception e) {
-                                              Log.e(TAG, "PLY export failed", e);
-                                              final String message = e.getMessage() == null
-                                                      ? e.getClass().getSimpleName() : e.getMessage();
-                                              runOnUiThread(() -> Toast.makeText(
-                                                      PreviewActivity.this,
-                                                      "Ошибка экспорта PLY: " + message,
-                                                      Toast.LENGTH_LONG).show());
-                                          } finally {
-                                              snapshot.close();
-                                              mPlyExportState.set(0);
-                                          }
-                                      });
-                                  } catch (RejectedExecutionException e) {
-                                      snapshot.close();
-                                      mPlyExportState.set(0);
-                                      Log.e(TAG, "PLY export executor rejected the task", e);
-                                  }
-                              }
-              """), "                "),
-              "frame callback export hook",
-          )
-          activity = replace_once(
-              activity,
-              "    protected void onDestroy() {\n        super.onDestroy();\n        mGLSurfaceView.close();\n    }",
-              "    protected void onDestroy() {\n"
-              "        super.onDestroy();\n"
-              "        mPlyExportExecutor.shutdown();\n"
-              "        mGLSurfaceView.close();\n"
-              "    }",
-              "export executor shutdown",
-          )
-          activity_file.write_text(activity)
+          module = Path("source/wrappers/android/tools/scanner")
+          module.mkdir(parents=True, exist_ok=True)
+          shutil.copytree(bundle / "app", module / "app", dirs_exist_ok=True)
+          shutil.copytree(bundle / "tests", module / "tests", dirs_exist_ok=True)
 
-          layout = layout_file.read_text()
-          layout = replace_once(
-              layout,
-              '            android:text="3D"/>',
-              '            android:text="3D"/>\n\n'
-              '        <Space\n'
-              '            android:layout_width="0dp"\n'
-              '            android:layout_height="1dp"\n'
-              '            android:layout_weight="1" />\n\n'
-              '        <TextView\n'
-              '            android:id="@+id/preview_export_ply_button"\n'
-              '            android:layout_width="wrap_content"\n'
-              '            android:layout_height="wrap_content"\n'
-              '            android:clickable="true"\n'
-              '            android:textSize="14dp"\n'
-              '            android:textColor="#ffffff"\n'
-              '            android:backgroundTint="#000000"\n'
-              '            android:text="PLY"/>',
-              "PLY button layout",
-          )
-          layout_file.write_text(layout)
-
-          strings_file = app / "src/main/res/values/strings.xml"
-          strings = strings_file.read_text()
-          strings = replace_once(
-              strings,
-              '<string name="app_name">RS Camera</string>',
-              '<string name="app_name">RealSense 3D Studio</string>',
-              "app display name",
-          )
-          strings_file.write_text(strings)
-
-          exporter_file = java_dir / "PlySnapshotExporter.java"
-          exporter_source = dedent("""\
-              package com.intel.realsense.camera;
-
-              import android.content.ContentResolver;
-              import android.content.ContentValues;
-              import android.content.Context;
-              import android.net.Uri;
-              import android.os.Build;
-              import android.os.Environment;
-              import android.provider.MediaStore;
-
-              import com.intel.realsense.librealsense.Extension;
-              import com.intel.realsense.librealsense.Frame;
-              import com.intel.realsense.librealsense.FrameSet;
-              import com.intel.realsense.librealsense.Pointcloud;
-              import com.intel.realsense.librealsense.Points;
-              import com.intel.realsense.librealsense.StreamType;
-              import com.intel.realsense.librealsense.VideoFrame;
-
-              import java.io.File;
-              import java.io.FileInputStream;
-              import java.io.IOException;
-              import java.io.InputStream;
-              import java.io.OutputStream;
-              import java.text.SimpleDateFormat;
-              import java.util.Date;
-              import java.util.Locale;
-
-              /** Exports one synchronized RealSense depth/color frame as a colored PLY point cloud. */
-              public final class PlySnapshotExporter {
-                  private PlySnapshotExporter() { }
-
-                  public static String export(Context context, FrameSet frames) throws Exception {
-                      File documents = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
-                      if (documents == null) {
-                          throw new IOException("External app storage is unavailable");
-                      }
-
-                      File outputDir = new File(documents, "RealSense3D");
-                      if (!outputDir.exists() && !outputDir.mkdirs()) {
-                          throw new IOException("Cannot create " + outputDir.getAbsolutePath());
-                      }
-
-                      String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
-                              .format(new Date());
-                      File output = new File(outputDir, "scan_" + stamp + ".ply");
-                      boolean complete = false;
-
-                      try (Frame depth = frames.first(StreamType.DEPTH);
-                           Frame color = frames.first(StreamType.COLOR)) {
-                          if (depth == null) {
-                              throw new IllegalStateException("Depth stream is missing. Enable Depth in Settings.");
-                          }
-                          if (color == null) {
-                              throw new IllegalStateException("Color stream is missing. Enable Color in Settings.");
-                          }
-                          if (!depth.is(Extension.DEPTH_FRAME)) {
-                              throw new IllegalStateException("The received Depth frame has an unsupported format.");
-                          }
-                          if (!color.is(Extension.VIDEO_FRAME)) {
-                              throw new IllegalStateException("The received Color frame has an unsupported format.");
-                          }
-
-                          try (Pointcloud pointcloud = new Pointcloud(StreamType.COLOR)) {
-                              Frame pointsFrame = pointcloud.process(depth);
-                              if (pointsFrame == depth) {
-                                  throw new IllegalStateException("RealSense did not produce a point cloud.");
-                              }
-                              try {
-                                  if (!pointsFrame.is(Extension.POINTS)) {
-                                      throw new IllegalStateException("Point cloud output is not valid.");
-                                  }
-                                  Points points = pointsFrame.as(Extension.POINTS);
-                                  VideoFrame texture = color.as(Extension.VIDEO_FRAME);
-                                  points.exportToPly(output.getAbsolutePath(), texture);
-                              } finally {
-                                  pointsFrame.close();
-                              }
-                          }
-
-                          if (!output.isFile() || output.length() == 0) {
-                              throw new IOException("PLY file was not created or is empty");
-                          }
-
-                          String location = publishToDownloads(context, output);
-                          complete = true;
-                          return location;
-                      } finally {
-                          if (!complete && output.exists()) {
-                              //noinspection ResultOfMethodCallIgnored
-                              output.delete();
-                          }
-                      }
-                  }
-
-                  private static String publishToDownloads(Context context, File source) throws Exception {
-                      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                          return source.getAbsolutePath();
-                      }
-
-                      ContentResolver resolver = context.getContentResolver();
-                      ContentValues values = new ContentValues();
-                      values.put(MediaStore.MediaColumns.DISPLAY_NAME, source.getName());
-                      values.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
-                      values.put(MediaStore.MediaColumns.RELATIVE_PATH,
-                              Environment.DIRECTORY_DOWNLOADS + "/RealSense3D");
-                      values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-
-                      Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-                      if (uri == null) {
-                          throw new IOException("Could not create a file in Downloads/RealSense3D");
-                      }
-
-                      try {
-                          try (InputStream input = new FileInputStream(source);
-                               OutputStream output = resolver.openOutputStream(uri)) {
-                              if (output == null) {
-                                  throw new IOException("Could not open the exported PLY destination");
-                              }
-                              byte[] buffer = new byte[64 * 1024];
-                              int count;
-                              while ((count = input.read(buffer)) != -1) {
-                                  output.write(buffer, 0, count);
-                              }
-                              output.flush();
-                          }
-
-                          ContentValues publish = new ContentValues();
-                          publish.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                          if (resolver.update(uri, publish, null, null) < 1) {
-                              throw new IOException("Could not publish the PLY file in Downloads");
-                          }
-
-                          //noinspection ResultOfMethodCallIgnored
-                          source.delete();
-                          return "Downloads/RealSense3D/" + source.getName();
-                      } catch (Exception e) {
-                          resolver.delete(uri, null, null);
-                          throw e;
-                      }
-                  }
-              }
-              """)
-          if exporter_file.exists():
-              raise SystemExit(f"Refusing to overwrite unexpected existing file: {exporter_file}")
-          exporter_file.write_text(exporter_source)
-
-          print("Added PLY snapshot export to the RealSense Camera app")
+          settings = Path("source/wrappers/android/settings.gradle")
+          text = settings.read_text()
+          include = "include ':tools:scanner:app'"
+          if include not in text:
+              anchor = "include ':tools:camera'"
+              if text.count(anchor) != 1:
+                  raise SystemExit("Could not find the Android tools module anchor in settings.gradle")
+              text = text.replace(anchor, anchor + "\n" + include, 1)
+          settings.write_text(text)
+          print("Standalone scanner module injected")
           PY
 
-      # Add live ICP registration, asynchronous fusion, and a persistent on-screen cloud.
-      - name: Add live point-cloud scan fusion
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          from textwrap import dedent
-
-          app = Path("source/wrappers/android/tools/camera")
-          java_dir = app / "src/main/java/com/intel/realsense/camera"
-          rs_java = Path("source/wrappers/android/librealsense/src/main/java/com/intel/realsense/librealsense")
-          activity_file = java_dir / "PreviewActivity.java"
-          layout_file = app / "src/main/res/layout/activity_preview.xml"
-          renderer_file = rs_java / "GLRenderer.java"
-          points_view_file = rs_java / "GLPointsFrame.java"
-          rs_surface_file = rs_java / "GLRsSurfaceView.java"
-          exporter_file = java_dir / "PlySnapshotExporter.java"
-          app_gradle_file = app / "build.gradle"
-
-          for required in (activity_file, layout_file, renderer_file, points_view_file, rs_surface_file, exporter_file, app_gradle_file):
-              if not required.exists():
-                  raise SystemExit(f"Required source file not found: {required}")
-
-          def replace_once(content: str, old: str, new: str, label: str) -> str:
-              count = content.count(old)
-              if count != 1:
-                  raise SystemExit(f"Patch anchor {label!r}: expected exactly 1 match, found {count}")
-              return content.replace(old, new, 1)
-
-          # 1) Add the on-device incremental ICP fusion engine.
-          fusion_file = rs_java / "PointCloudFusion.java"
-          if fusion_file.exists():
-              raise SystemExit(f"Refusing to overwrite unexpected file: {fusion_file}")
-          fusion_file.write_text(dedent(r'''
-              package com.intel.realsense.librealsense;
-
-              import java.io.BufferedWriter;
-              import java.io.File;
-              import java.io.FileWriter;
-              import java.io.IOException;
-              import java.util.HashMap;
-              import java.util.Locale;
-              import java.util.Map;
-
-              /**
-               * Incremental RGB-D point-cloud fusion using lightweight point-to-point ICP.
-               * Coordinates are expressed in the first accepted camera frame. This is an
-               * online fusion preview, not a loop-closing SLAM or watertight-mesh system.
-               */
-              public final class PointCloudFusion {
-                  private static final int MAX_POINTS = 120000;
-                  private static final int MAX_ICP_SAMPLES = 700;
-                  private static final int MAX_FRAME_POINTS = 3500;
-                  private static final float VOXEL_SIZE = 0.015f;
-                  private static final float CELL_SIZE = 0.10f;
-                  private static final float MAX_DISTANCE = 0.09f;
-                  private static final float MAX_DISTANCE_SQ = MAX_DISTANCE * MAX_DISTANCE;
-                  private static final int ICP_ITERATIONS = 6;
-                  private static final long MIN_INTERVAL_NS = 70_000_000L;
-
-                  private final float[] mapXYZ = new float[MAX_POINTS * 3];
-                  private final byte[] mapRGBA = new byte[MAX_POINTS * 4];
-                  private final int[] mapSamples = new int[MAX_POINTS];
-                  private volatile int mapCount = 0;
-                  private final Map<Long, Integer> voxelIndex = new HashMap<>();
-                  private final Map<Long, IntBucket> spatialIndex = new HashMap<>();
-
-                  // Rigid transform from current camera coordinates into the map frame.
-                  private float[] poseR = identity3();
-                  private float[] poseT = new float[3];
-                  private boolean havePose = false;
-                  private volatile boolean tracking = false;
-                  private int acceptedFrames = 0;
-                  private int rejectedFrames = 0;
-                  private volatile long lastFusionNs = 0;
-                  private volatile int sessionId = 0;
-
-                  public static final class Snapshot {
-                      public final float[] vertices;
-                      public final byte[] colors;
-                      public final int pointCount;
-                      private Snapshot(float[] vertices, byte[] colors, int pointCount) {
-                          this.vertices = vertices;
-                          this.colors = colors;
-                          this.pointCount = pointCount;
-                      }
-                  }
-
-                  private static final class IntBucket {
-                      int[] values = new int[8];
-                      int size = 0;
-                      void add(int value) {
-                          if (size == values.length) {
-                              int[] next = new int[values.length * 2];
-                              System.arraycopy(values, 0, next, 0, size);
-                              values = next;
-                          }
-                          values[size++] = value;
-                      }
-                  }
-
-                  private static final class PoseResult {
-                      final float[] rotation;
-                      final float[] translation;
-                      final float rmse;
-                      final int correspondences;
-                      PoseResult(float[] rotation, float[] translation, float rmse, int correspondences) {
-                          this.rotation = rotation;
-                          this.translation = translation;
-                          this.rmse = rmse;
-                          this.correspondences = correspondences;
-                      }
-                  }
-
-                  public synchronized void reset() {
-                      sessionId++;
-                      mapCount = 0;
-                      voxelIndex.clear();
-                      spatialIndex.clear();
-                      poseR = identity3();
-                      poseT = new float[3];
-                      havePose = false;
-                      tracking = false;
-                      acceptedFrames = 0;
-                      rejectedFrames = 0;
-                      lastFusionNs = 0;
-                  }
-
-                  public int getPointCount() { return mapCount; }
-                  public boolean isTracking() { return tracking; }
-                  public synchronized int getAcceptedFrames() { return acceptedFrames; }
-                  public synchronized int getRejectedFrames() { return rejectedFrames; }
-                  public int getSessionId() { return sessionId; }
-                  public boolean shouldIntegrateNow() {
-                      return lastFusionNs == 0 || System.nanoTime() - lastFusionNs >= MIN_INTERVAL_NS;
-                  }
-
-                  /** Returns true only when the frame was registered and fused. */
-                  public synchronized boolean integrate(float[] vertices, byte[] rgba) {
-                      return integrate(vertices, rgba, sessionId);
-                  }
-
-                  public synchronized boolean integrate(float[] vertices, byte[] rgba, int expectedSessionId) {
-                      if (expectedSessionId != sessionId) return false;
-                      if (vertices == null || vertices.length < 300) return false;
-                      long now = System.nanoTime();
-                      if (lastFusionNs != 0 && now - lastFusionNs < MIN_INTERVAL_NS) return false;
-                      lastFusionNs = now; // throttle failed registrations too, not only successful fusions
-
-                      int sourceCount = vertices.length / 3;
-                      float[] samples = collectSamples(vertices, sourceCount);
-                      int sampleCount = samples.length / 3;
-                      if (sampleCount < 25) {
-                          tracking = false;
-                          rejectedFrames++;
-                          return false;
-                      }
-
-                      if (mapCount == 0 || !havePose) {
-                          poseR = identity3();
-                          poseT = new float[3];
-                          havePose = true;
-                          addFrameToMap(vertices, rgba, sourceCount, poseR, poseT);
-                          tracking = mapCount > 0;
-                          if (tracking) {
-                              acceptedFrames++;
-                              lastFusionNs = now;
-                          }
-                          return tracking;
-                      }
-
-                      PoseResult result = register(samples, sampleCount);
-                      if (result == null) {
-                          tracking = false;
-                          rejectedFrames++;
-                          return false;
-                      }
-
-                      poseR = result.rotation;
-                      poseT = result.translation;
-                      addFrameToMap(vertices, rgba, sourceCount, poseR, poseT);
-                      tracking = true;
-                      acceptedFrames++;
-                      lastFusionNs = now;
-                      return true;
-                  }
-
-                  private float[] collectSamples(float[] vertices, int pointCount) {
-                      int step = Math.max(1, (pointCount + MAX_ICP_SAMPLES - 1) / MAX_ICP_SAMPLES);
-                      float[] tmp = new float[Math.min(MAX_ICP_SAMPLES, pointCount) * 3];
-                      int out = 0;
-                      for (int i = 0; i < pointCount && out + 2 < tmp.length; i += step) {
-                          int k = i * 3;
-                          float x = vertices[k], y = vertices[k + 1], z = vertices[k + 2];
-                          if (!validPoint(x, y, z)) continue;
-                          tmp[out++] = x; tmp[out++] = y; tmp[out++] = z;
-                      }
-                      float[] result = new float[out];
-                      System.arraycopy(tmp, 0, result, 0, out);
-                      return result;
-                  }
-
-                  private boolean validPoint(float x, float y, float z) {
-                      return Float.isFinite(x) && Float.isFinite(y) && Float.isFinite(z)
-                              && z > 0.18f && z < 8.0f
-                              && Math.abs(x) < 8.0f && Math.abs(y) < 8.0f;
-                  }
-
-                  private PoseResult register(float[] samples, int sampleCount) {
-                      float[] r = poseR.clone();
-                      float[] t = poseT.clone();
-                      float[] src = new float[sampleCount * 3];
-                      float[] dst = new float[sampleCount * 3];
-                      int lastMatches = 0;
-                      float lastRmse = Float.POSITIVE_INFINITY;
-
-                      for (int iteration = 0; iteration < ICP_ITERATIONS; iteration++) {
-                          int matches = 0;
-                          double errorSum = 0.0;
-                          for (int i = 0; i < sampleCount; i++) {
-                              int k = i * 3;
-                              float x = samples[k], y = samples[k + 1], z = samples[k + 2];
-                              float wx = r[0] * x + r[1] * y + r[2] * z + t[0];
-                              float wy = r[3] * x + r[4] * y + r[5] * z + t[1];
-                              float wz = r[6] * x + r[7] * y + r[8] * z + t[2];
-                              int nearest = findNearest(wx, wy, wz);
-                              if (nearest < 0) continue;
-                              float dx = wx - mapXYZ[nearest * 3];
-                              float dy = wy - mapXYZ[nearest * 3 + 1];
-                              float dz = wz - mapXYZ[nearest * 3 + 2];
-                              float d2 = dx * dx + dy * dy + dz * dz;
-                              if (d2 > MAX_DISTANCE_SQ) continue;
-                              int q = matches * 3;
-                              src[q] = wx; src[q + 1] = wy; src[q + 2] = wz;
-                              dst[q] = mapXYZ[nearest * 3];
-                              dst[q + 1] = mapXYZ[nearest * 3 + 1];
-                              dst[q + 2] = mapXYZ[nearest * 3 + 2];
-                              errorSum += d2;
-                              matches++;
-                          }
-
-                          int minimum = Math.max(25, sampleCount / 12);
-                          if (matches < minimum) return null;
-                          float rmse = (float) Math.sqrt(errorSum / matches);
-                          float[] deltaR = new float[9];
-                          float[] deltaT = new float[3];
-                          if (!solveRigid(src, dst, matches, deltaR, deltaT)) return null;
-                          float shift = length(deltaT[0], deltaT[1], deltaT[2]);
-                          float angle = rotationAngle(deltaR);
-                          // Reject large jumps rather than painting a visibly doubled scan.
-                          if (shift > 0.16f || angle > 0.65f) return null;
-
-                          t = multiplyVector(deltaR, t);
-                          t[0] += deltaT[0]; t[1] += deltaT[1]; t[2] += deltaT[2];
-                          r = multiply3(deltaR, r);
-                          lastMatches = matches;
-                          lastRmse = rmse;
-                          if (shift < 0.0015f && angle < 0.002f) break;
-                      }
-
-                      int verified = 0;
-                      double verifyError = 0.0;
-                      for (int i = 0; i < sampleCount; i++) {
-                          int k = i * 3;
-                          float x = r[0] * samples[k] + r[1] * samples[k + 1] + r[2] * samples[k + 2] + t[0];
-                          float y = r[3] * samples[k] + r[4] * samples[k + 1] + r[5] * samples[k + 2] + t[1];
-                          float z = r[6] * samples[k] + r[7] * samples[k + 1] + r[8] * samples[k + 2] + t[2];
-                          int nearest = findNearest(x, y, z);
-                          if (nearest < 0) continue;
-                          float dx = x - mapXYZ[nearest * 3];
-                          float dy = y - mapXYZ[nearest * 3 + 1];
-                          float dz = z - mapXYZ[nearest * 3 + 2];
-                          float d2 = dx * dx + dy * dy + dz * dz;
-                          if (d2 <= MAX_DISTANCE_SQ) { verifyError += d2; verified++; }
-                      }
-                      int minimum = Math.max(25, sampleCount / 12);
-                      if (verified < minimum) return null;
-                      float rmse = (float) Math.sqrt(verifyError / verified);
-                      if (!Float.isFinite(rmse) || rmse > 0.065f) return null;
-                      if (lastMatches < minimum || lastRmse > 0.075f) return null;
-                      return new PoseResult(r, t, rmse, verified);
-                  }
-
-                  private int findNearest(float x, float y, float z) {
-                      int cx = floorCell(x), cy = floorCell(y), cz = floorCell(z);
-                      int best = -1;
-                      float bestD2 = MAX_DISTANCE_SQ;
-                      for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++)
-                          for (int dz = -1; dz <= 1; dz++) {
-                              IntBucket bucket = spatialIndex.get(pack(cx + dx, cy + dy, cz + dz));
-                              if (bucket == null) continue;
-                              for (int j = 0; j < bucket.size; j++) {
-                                  int idx = bucket.values[j], k = idx * 3;
-                                  float ax = x - mapXYZ[k], ay = y - mapXYZ[k + 1], az = z - mapXYZ[k + 2];
-                                  float d2 = ax * ax + ay * ay + az * az;
-                                  if (d2 < bestD2) { bestD2 = d2; best = idx; }
-                              }
-                          }
-                      return best;
-                  }
-
-                  private void addFrameToMap(float[] vertices, byte[] rgba, int pointCount,
-                                             float[] r, float[] t) {
-                      int step = Math.max(1, (pointCount + MAX_FRAME_POINTS - 1) / MAX_FRAME_POINTS);
-                      for (int i = 0; i < pointCount; i += step) {
-                          int k = i * 3;
-                          float x = vertices[k], y = vertices[k + 1], z = vertices[k + 2];
-                          if (!validPoint(x, y, z)) continue;
-                          float wx = r[0] * x + r[1] * y + r[2] * z + t[0];
-                          float wy = r[3] * x + r[4] * y + r[5] * z + t[1];
-                          float wz = r[6] * x + r[7] * y + r[8] * z + t[2];
-                          int p = i * 4;
-                          int red = rgba != null && p + 2 < rgba.length ? rgba[p] & 255 : grayFromDepth(wz);
-                          int green = rgba != null && p + 2 < rgba.length ? rgba[p + 1] & 255 : red;
-                          int blue = rgba != null && p + 2 < rgba.length ? rgba[p + 2] & 255 : red;
-                          addMapPoint(wx, wy, wz, red, green, blue);
-                      }
-                  }
-
-                  private int grayFromDepth(float z) {
-                      return Math.max(32, Math.min(220, (int) (220.0f - z * 28.0f)));
-                  }
-
-                  private void addMapPoint(float x, float y, float z, int red, int green, int blue) {
-                      int vx = (int) Math.floor(x / VOXEL_SIZE);
-                      int vy = (int) Math.floor(y / VOXEL_SIZE);
-                      int vz = (int) Math.floor(z / VOXEL_SIZE);
-                      long vk = pack(vx, vy, vz);
-                      Integer existing = voxelIndex.get(vk);
-                      if (existing != null) {
-                          int idx = existing;
-                          int n = Math.min(64, mapSamples[idx]);
-                          float inv = 1.0f / (n + 1.0f);
-                          int q = idx * 3;
-                          mapXYZ[q] += (x - mapXYZ[q]) * inv;
-                          mapXYZ[q + 1] += (y - mapXYZ[q + 1]) * inv;
-                          mapXYZ[q + 2] += (z - mapXYZ[q + 2]) * inv;
-                          int c = idx * 4;
-                          mapRGBA[c] = (byte) ((mapRGBA[c] & 255) + (red - (mapRGBA[c] & 255)) * inv);
-                          mapRGBA[c + 1] = (byte) ((mapRGBA[c + 1] & 255) + (green - (mapRGBA[c + 1] & 255)) * inv);
-                          mapRGBA[c + 2] = (byte) ((mapRGBA[c + 2] & 255) + (blue - (mapRGBA[c + 2] & 255)) * inv);
-                          mapSamples[idx] = Math.min(64, n + 1);
-                          return;
-                      }
-                      if (mapCount >= MAX_POINTS) return;
-                      int index = mapCount++;
-                      int q = index * 3;
-                      mapXYZ[q] = x; mapXYZ[q + 1] = y; mapXYZ[q + 2] = z;
-                      int c = index * 4;
-                      mapRGBA[c] = (byte) red; mapRGBA[c + 1] = (byte) green;
-                      mapRGBA[c + 2] = (byte) blue; mapRGBA[c + 3] = (byte) 255;
-                      mapSamples[index] = 1;
-                      voxelIndex.put(vk, index);
-                      long cellKey = pack(floorCell(x), floorCell(y), floorCell(z));
-                      IntBucket bucket = spatialIndex.get(cellKey);
-                      if (bucket == null) { bucket = new IntBucket(); spatialIndex.put(cellKey, bucket); }
-                      bucket.add(index);
-                  }
-
-                  private static int floorCell(float value) { return (int) Math.floor(value / CELL_SIZE); }
-                  private static long pack(int x, int y, int z) {
-                      return (((long) x & 0x1fffffL) << 42)
-                              | (((long) y & 0x1fffffL) << 21)
-                              | ((long) z & 0x1fffffL);
-                  }
-
-                  public synchronized Snapshot snapshot() {
-                      float[] xyz = new float[mapCount * 3];
-                      byte[] rgba = new byte[mapCount * 4];
-                      System.arraycopy(mapXYZ, 0, xyz, 0, xyz.length);
-                      System.arraycopy(mapRGBA, 0, rgba, 0, rgba.length);
-                      return new Snapshot(xyz, rgba, mapCount);
-                  }
-
-                  public void writePly(File file) throws IOException {
-                      Snapshot data = snapshot(); // copy under lock; disk I/O happens without blocking frame fusion
-                      if (data.pointCount == 0) throw new IOException("Нет накопленных точек. Сначала запустите сканирование.");
-                      File parent = file.getParentFile();
-                      if (parent != null && !parent.exists() && !parent.mkdirs())
-                          throw new IOException("Не удалось создать каталог для PLY");
-                      try (BufferedWriter writer = new BufferedWriter(new FileWriter(file), 256 * 1024)) {
-                          writer.write("ply\nformat ascii 1.0\n");
-                          writer.write("element vertex " + data.pointCount + "\n");
-                          writer.write("property float x\nproperty float y\nproperty float z\n");
-                          writer.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n");
-                          for (int i = 0; i < data.pointCount; i++) {
-                              int p = i * 3, c = i * 4;
-                              writer.write(Float.toString(data.vertices[p])); writer.write(' ');
-                              writer.write(Float.toString(data.vertices[p + 1])); writer.write(' ');
-                              writer.write(Float.toString(data.vertices[p + 2])); writer.write(' ');
-                              writer.write(Integer.toString(data.colors[c] & 255)); writer.write(' ');
-                              writer.write(Integer.toString(data.colors[c + 1] & 255)); writer.write(' ');
-                              writer.write(Integer.toString(data.colors[c + 2] & 255)); writer.write('\n');
-                          }
-                      }
-                  }
-
-                  private static boolean solveRigid(float[] src, float[] dst, int count,
-                                                    float[] outR, float[] outT) {
-                      if (count < 3) return false;
-                      double sx = 0, sy = 0, sz = 0, tx = 0, ty = 0, tz = 0;
-                      for (int i = 0; i < count; i++) {
-                          int k = i * 3;
-                          sx += src[k]; sy += src[k + 1]; sz += src[k + 2];
-                          tx += dst[k]; ty += dst[k + 1]; tz += dst[k + 2];
-                      }
-                      double inv = 1.0 / count;
-                      sx *= inv; sy *= inv; sz *= inv; tx *= inv; ty *= inv; tz *= inv;
-                      double sxx = 0, sxy = 0, sxz = 0, syx = 0, syy = 0, syz = 0,
-                              szx = 0, szy = 0, szz = 0;
-                      for (int i = 0; i < count; i++) {
-                          int k = i * 3;
-                          double ax = src[k] - sx, ay = src[k + 1] - sy, az = src[k + 2] - sz;
-                          double bx = dst[k] - tx, by = dst[k + 1] - ty, bz = dst[k + 2] - tz;
-                          sxx += ax * bx; sxy += ax * by; sxz += ax * bz;
-                          syx += ay * bx; syy += ay * by; syz += ay * bz;
-                          szx += az * bx; szy += az * by; szz += az * bz;
-                      }
-                      double[][] n = new double[4][4];
-                      n[0][0] = sxx + syy + szz;
-                      n[0][1] = n[1][0] = syz - szy;
-                      n[0][2] = n[2][0] = szx - sxz;
-                      n[0][3] = n[3][0] = sxy - syx;
-                      n[1][1] = sxx - syy - szz;
-                      n[1][2] = n[2][1] = sxy + syx;
-                      n[1][3] = n[3][1] = szx + sxz;
-                      n[2][2] = -sxx + syy - szz;
-                      n[2][3] = n[3][2] = syz + szy;
-                      n[3][3] = -sxx - syy + szz;
-
-                      double[][] eigenvectors = new double[4][4];
-                      for (int i = 0; i < 4; i++) eigenvectors[i][i] = 1.0;
-                      for (int iteration = 0; iteration < 40; iteration++) {
-                          int p = 0, q = 1;
-                          double largest = Math.abs(n[p][q]);
-                          for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
-                              double value = Math.abs(n[i][j]);
-                              if (value > largest) { largest = value; p = i; q = j; }
-                          }
-                          if (largest < 1e-10) break;
-                          double theta = 0.5 * Math.atan2(2.0 * n[p][q], n[q][q] - n[p][p]);
-                          double c = Math.cos(theta), s = Math.sin(theta);
-                          double app = n[p][p], aqq = n[q][q], apq = n[p][q];
-                          n[p][p] = c * c * app - 2 * s * c * apq + s * s * aqq;
-                          n[q][q] = s * s * app + 2 * s * c * apq + c * c * aqq;
-                          n[p][q] = n[q][p] = 0.0;
-                          for (int k = 0; k < 4; k++) {
-                              if (k == p || k == q) continue;
-                              double akp = n[k][p], akq = n[k][q];
-                              n[k][p] = n[p][k] = c * akp - s * akq;
-                              n[k][q] = n[q][k] = s * akp + c * akq;
-                          }
-                          for (int k = 0; k < 4; k++) {
-                              double vkp = eigenvectors[k][p], vkq = eigenvectors[k][q];
-                              eigenvectors[k][p] = c * vkp - s * vkq;
-                              eigenvectors[k][q] = s * vkp + c * vkq;
-                          }
-                      }
-                      int best = 0;
-                      for (int i = 1; i < 4; i++) if (n[i][i] > n[best][best]) best = i;
-                      double qw = eigenvectors[0][best], qx = eigenvectors[1][best];
-                      double qy = eigenvectors[2][best], qz = eigenvectors[3][best];
-                      double norm = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
-                      if (norm < 1e-12) return false;
-                      qw /= norm; qx /= norm; qy /= norm; qz /= norm;
-                      outR[0] = (float) (1 - 2 * (qy * qy + qz * qz));
-                      outR[1] = (float) (2 * (qx * qy - qz * qw));
-                      outR[2] = (float) (2 * (qx * qz + qy * qw));
-                      outR[3] = (float) (2 * (qx * qy + qz * qw));
-                      outR[4] = (float) (1 - 2 * (qx * qx + qz * qz));
-                      outR[5] = (float) (2 * (qy * qz - qx * qw));
-                      outR[6] = (float) (2 * (qx * qz - qy * qw));
-                      outR[7] = (float) (2 * (qy * qz + qx * qw));
-                      outR[8] = (float) (1 - 2 * (qx * qx + qy * qy));
-                      outT[0] = (float) (tx - (outR[0] * sx + outR[1] * sy + outR[2] * sz));
-                      outT[1] = (float) (ty - (outR[3] * sx + outR[4] * sy + outR[5] * sz));
-                      outT[2] = (float) (tz - (outR[6] * sx + outR[7] * sy + outR[8] * sz));
-                      return true;
-                  }
-
-                  private static float[] identity3() { return new float[]{1,0,0, 0,1,0, 0,0,1}; }
-                  private static float[] multiply3(float[] a, float[] b) {
-                      float[] r = new float[9];
-                      for (int row = 0; row < 3; row++) for (int col = 0; col < 3; col++)
-                          r[row * 3 + col] = a[row * 3] * b[col] + a[row * 3 + 1] * b[3 + col]
-                                  + a[row * 3 + 2] * b[6 + col];
-                      return r;
-                  }
-                  private static float[] multiplyVector(float[] r, float[] v) {
-                      return new float[]{r[0]*v[0]+r[1]*v[1]+r[2]*v[2],
-                              r[3]*v[0]+r[4]*v[1]+r[5]*v[2],
-                              r[6]*v[0]+r[7]*v[1]+r[8]*v[2]};
-                  }
-                  private static float length(float x, float y, float z) {
-                      return (float) Math.sqrt(x*x + y*y + z*z);
-                  }
-                  private static float rotationAngle(float[] r) {
-                      float c = Math.max(-1.0f, Math.min(1.0f, (r[0] + r[4] + r[8] - 1.0f) * 0.5f));
-                      return (float) Math.acos(c);
-                  }
-              }
-              ''').lstrip())
-
-          # 2) Let GLPointsFrame display a persistent fused cloud, using reusable direct GL buffers.
-          points_view = points_view_file.read_text()
-          points_view = replace_once(points_view,
-              "import java.nio.ByteOrder;\nimport java.nio.IntBuffer;",
-              "import java.nio.ByteOrder;\nimport java.nio.IntBuffer;\nimport java.nio.FloatBuffer;",
-              "GLPointsFrame FloatBuffer import")
-          points_view = replace_once(points_view,
-              "    private IntBuffer mGlTexture;",
-              "    private IntBuffer mGlTexture;\n"
-              "    private FloatBuffer mAccumulatedVertices;\n"
-              "    private ByteBuffer mAccumulatedColors;\n"
-              "    private int mAccumulatedCount = 0;\n"
-              "    private float mCloudCenterX = 0f, mCloudCenterY = 0f, mCloudMinZ = 0f, mCloudScale = 1f;",
-              "GLPointsFrame accumulated buffer fields")
-          points_view = replace_once(points_view,
-              "    public int getTexture() { return mGlTexture.array()[0]; }",
-              "    public int getTexture() { return mGlTexture.array()[0]; }\n\n"
-              "    public synchronized Frame cloneTextureFrame() {\n"
-              "        return mTexture == null ? null : mTexture.clone();\n"
-              "    }\n\n"
-              "    public byte[] createTexture(Points points, VideoFrame vf) {\n"
-              "        if (vf == null) return createTexture(points.getVertices(), 1.2f);\n"
-              "        int w = vf.getWidth(), h = vf.getHeight();\n"
-              "        int pointCount = points.getCount();\n"
-              "        byte[] textureData = new byte[w * h * 3];\n"
-              "        byte[] texture = new byte[pointCount * 4];\n"
-              "        float[] xyz = points.getVertices();\n"
-              "        float[] uv = points.getTextureCoordinates();\n"
-              "        vf.getData(textureData);\n"
-              "        for (int i = 0; i < pointCount; i++) {\n"
-              "            if (xyz[i * 3 + 2] == 0) continue;\n"
-              "            int x = Math.round(uv[i * 2] * w);\n"
-              "            int y = Math.round(uv[i * 2 + 1] * h);\n"
-              "            if (x < 0 || y < 0 || x >= w || y >= h) continue;\n"
-              "            int p = (x + y * w) * 3;\n"
-              "            texture[i * 4] = textureData[p];\n"
-              "            texture[i * 4 + 1] = textureData[p + 1];\n"
-              "            texture[i * 4 + 2] = textureData[p + 2];\n"
-              "            texture[i * 4 + 3] = (byte) 255;\n"
-              "        }\n"
-              "        return texture;\n"
-              "    }\n\n"
-              "    public synchronized void setAccumulatedCloud(float[] vertices, byte[] colors) {\n"
-              "        if (vertices == null || vertices.length < 3) { mAccumulatedCount = 0; return; }\n"
-              "        int vertexCount = vertices.length / 3;\n"
-              "        if (mAccumulatedVertices == null || mAccumulatedVertices.capacity() < vertices.length) {\n"
-              "            int capacity = Math.max(vertices.length, mAccumulatedVertices == null ? 4096 : mAccumulatedVertices.capacity() * 2);\n"
-              "            mAccumulatedVertices = ByteBuffer.allocateDirect(capacity * 4)\n"
-              "                    .order(ByteOrder.nativeOrder()).asFloatBuffer();\n"
-              "        }\n"
-              "        mAccumulatedVertices.clear();\n"
-              "        mAccumulatedVertices.put(vertices, 0, vertices.length);\n"
-              "        mAccumulatedVertices.position(0);\n"
-              "        if (colors != null && colors.length >= vertexCount * 4) {\n"
-              "            if (mAccumulatedColors == null || mAccumulatedColors.capacity() < vertexCount * 4) {\n"
-              "                int capacity = Math.max(vertexCount * 4, mAccumulatedColors == null ? 16384 : mAccumulatedColors.capacity() * 2);\n"
-              "                mAccumulatedColors = ByteBuffer.allocateDirect(capacity).order(ByteOrder.nativeOrder());\n"
-              "            }\n"
-              "            mAccumulatedColors.clear();\n"
-              "            mAccumulatedColors.put(colors, 0, vertexCount * 4);\n"
-              "            mAccumulatedColors.position(0);\n"
-              "        } else { mAccumulatedColors = null; }\n"
-              "        float minX = Float.POSITIVE_INFINITY, maxX = Float.NEGATIVE_INFINITY;\n"
-              "        float minY = Float.POSITIVE_INFINITY, maxY = Float.NEGATIVE_INFINITY;\n"
-              "        float minZ = Float.POSITIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;\n"
-              "        for (int i = 0; i < vertices.length; i += 3) {\n"
-              "            minX = Math.min(minX, vertices[i]); maxX = Math.max(maxX, vertices[i]);\n"
-              "            minY = Math.min(minY, vertices[i + 1]); maxY = Math.max(maxY, vertices[i + 1]);\n"
-              "            minZ = Math.min(minZ, vertices[i + 2]); maxZ = Math.max(maxZ, vertices[i + 2]);\n"
-              "        }\n"
-              "        mCloudCenterX = (minX + maxX) * 0.5f;\n"
-              "        mCloudCenterY = (minY + maxY) * 0.5f;\n"
-              "        mCloudMinZ = minZ;\n"
-              "        float extent = Math.max(maxX - minX, Math.max(maxY - minY, maxZ - minZ));\n"
-              "        mCloudScale = extent > 1.8f ? 1.8f / extent : 1f;\n"
-              "        mAccumulatedCount = vertexCount;\n"
-              "    }",
-              "GLPointsFrame setAccumulatedCloud")
-          start = points_view.index("    @Override\n    public synchronized void draw(Rect rect)")
-          end = points_view.index("    //fallback to gray scale", start)
-          new_draw = '''    @Override
-              public synchronized void draw(Rect rect)
-              {
-                  if (mAccumulatedCount > 0 && mAccumulatedVertices != null) {
-                      drawAccumulated(rect);
-                      return;
-                  }
-                  if (mFrame == null || !(mFrame.is(Extension.POINTS)))
-                      return;
-
-                  setViewport(rect);
-                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
-                  GLES10.glPushMatrix();
-                  GLES10.glLoadIdentity();
-                  GLES10.glOrthof(1f, -1f, -1f, 1f, -7f, 0f);
-                  GLES10.glRotatef(180, 0.0f, 0.0f, 1.0f);
-                  GLES10.glRotatef(-mDeltaY * mRotationFactor, 1.0f, 0.0f, 0.0f);
-                  GLES10.glRotatef(mDeltaX * mRotationFactor, 0.0f, 1.0f, 0.0f);
-                  Points points = mFrame.as(Extension.POINTS);
-                  float[] data = points.getVertices();
-                  byte[] tex = mTexture == null ? createTexture(data, 1.2f) : createTexture(points);
-                  drawPoints(data, tex);
-                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
-                  GLES10.glPopMatrix();
-              }
-
-              private void drawAccumulated(Rect rect) {
-                  setViewport(rect);
-                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
-                  GLES10.glPushMatrix();
-                  GLES10.glLoadIdentity();
-                  GLES10.glOrthof(1f, -1f, -1f, 1f, -7f, 0f);
-                  GLES10.glRotatef(180, 0.0f, 0.0f, 1.0f);
-                  GLES10.glRotatef(-mDeltaY * mRotationFactor, 1.0f, 0.0f, 0.0f);
-                  GLES10.glRotatef(mDeltaX * mRotationFactor, 0.0f, 1.0f, 0.0f);
-                  GLES10.glScalef(mCloudScale, mCloudScale, mCloudScale);
-                  GLES10.glTranslatef(-mCloudCenterX, -mCloudCenterY, -mCloudMinZ);
-
-                  if (mAccumulatedColors != null) {
-                      GLES10.glEnableClientState(GLES10.GL_COLOR_ARRAY);
-                      mAccumulatedColors.position(0);
-                      GLES10.glColorPointer(4, GLES10.GL_UNSIGNED_BYTE, 0, mAccumulatedColors);
-                  }
-                  GLES10.glEnableClientState(GLES10.GL_VERTEX_ARRAY);
-                  mAccumulatedVertices.position(0);
-                  GLES10.glVertexPointer(3, GLES10.GL_FLOAT, 0, mAccumulatedVertices);
-                  GLES10.glPointSize(2.0f);
-                  GLES10.glDrawArrays(GLES10.GL_POINTS, 0, mAccumulatedCount);
-                  GLES10.glDisableClientState(GLES10.GL_VERTEX_ARRAY);
-                  if (mAccumulatedColors != null) GLES10.glDisableClientState(GLES10.GL_COLOR_ARRAY);
-
-                  GLES10.glMatrixMode(GLES10.GL_PROJECTION);
-                  GLES10.glPopMatrix();
-              }
-
-          '''
-          points_view = points_view[:start] + new_draw + points_view[end:]
-          points_view = replace_once(points_view,
-              "        mGlTexture = null;\n    }",
-              "        mGlTexture = null;\n"
-              "        mAccumulatedVertices = null;\n"
-              "        mAccumulatedColors = null;\n"
-              "        mAccumulatedCount = 0;\n"
-              "    }",
-              "GLPointsFrame close cloud buffers")
-          points_view_file.write_text(points_view)
-
-          # 3) Feed each colourized point frame into the fusion engine and expose controls.
-          renderer = renderer_file.read_text()
-          renderer = replace_once(renderer,
-              "import java.util.ArrayList;",
-              "import java.io.File;\n"
-              "import java.io.IOException;\n"
-              "import java.util.ArrayList;\n"
-              "import java.util.concurrent.ExecutorService;\n"
-              "import java.util.concurrent.Executors;\n"
-              "import java.util.concurrent.RejectedExecutionException;\n"
-              "import java.util.concurrent.atomic.AtomicBoolean;",
-              "GLRenderer IO imports")
-          renderer = replace_once(renderer,
-              "    private boolean mShowPoints = false;",
-              "    private boolean mShowPoints = false;\n"
-              "    private final PointCloudFusion mScanFusion = new PointCloudFusion();\n"
-              "    private final ExecutorService mFusionExecutor = Executors.newSingleThreadExecutor();\n"
-              "    private final AtomicBoolean mFusionQueued = new AtomicBoolean(false);\n"
-              "    private volatile boolean mScanActive = false;\n"
-              "    private volatile int mScanGeneration = 0;",
-              "GLRenderer scan fields")
-          renderer = replace_once(renderer,
-              "            if(mPointsTexture != null && curr instanceof GLPointsFrame){\n"
-              "                ((GLPointsFrame) curr).setTextureFrame(mPointsTexture);\n"
-              "                mPointsTexture.close();\n"
-              "                mPointsTexture = null;\n"
-              "            }",
-              "            if(mPointsTexture != null && curr instanceof GLPointsFrame){\n"
-              "                ((GLPointsFrame) curr).setTextureFrame(mPointsTexture);\n"
-              "                mPointsTexture.close();\n"
-              "                mPointsTexture = null;\n"
-              "            }\n"
-              "\n"
-              "            if (mScanActive && curr instanceof GLPointsFrame && f.is(Extension.POINTS)\n"
-              "                    && mScanFusion.shouldIntegrateNow()\n"
-              "                    && mFusionQueued.compareAndSet(false, true)) {\n"
-              "                final int generation = mScanGeneration;\n"
-              "                final Frame pointFrame = f.clone();\n"
-              "                final GLPointsFrame pointView = (GLPointsFrame) curr;\n"
-              "                final Frame colorFrame = pointView.cloneTextureFrame();\n"
-              "                try {\n"
-              "                    mFusionExecutor.execute(() -> {\n"
-              "                        try (Frame retainedPoints = pointFrame; Frame retainedColor = colorFrame) {\n"
-              "                            if (!mScanActive || generation != mScanGeneration) return;\n"
-              "                            Points points = retainedPoints.as(Extension.POINTS);\n"
-              "                            VideoFrame color = retainedColor != null && retainedColor.is(Extension.VIDEO_FRAME)\n"
-              "                                    ? retainedColor.as(Extension.VIDEO_FRAME) : null;\n"
-              "                            byte[] colors = pointView.createTexture(points, color);\n"
-              "                            if (mScanFusion.integrate(points.getVertices(), colors, generation)\n"
-              "                                    && generation == mScanGeneration) {\n"
-              "                                PointCloudFusion.Snapshot snapshot = mScanFusion.snapshot();\n"
-              "                                pointView.setAccumulatedCloud(snapshot.vertices, snapshot.colors);\n"
-              "                            }\n"
-              "                        } catch (Exception e) {\n"
-              "                            android.util.Log.e(\"RealSenseScan\", \"Point-cloud fusion failed\", e);\n"
-              "                        } finally {\n"
-              "                            mFusionQueued.set(false);\n"
-              "                        }\n"
-              "                    });\n"
-              "                } catch (RejectedExecutionException e) {\n"
-              "                    pointFrame.close();\n"
-              "                    if (colorFrame != null) colorFrame.close();\n"
-              "                    mFusionQueued.set(false);\n"
-              "                    android.util.Log.e(\"RealSenseScan\", \"Fusion executor rejected task\", e);\n"
-              "                }\n"
-              "            }",
-              "GLRenderer fuse points on upload")
-          renderer = replace_once(renderer,
-              "    public void showPointcloud(boolean showPoints) {",
-              "    public void startScan() {\n"
-              "        synchronized (mFrames) {\n"
-              "            mScanFusion.reset();\n"
-              "            mScanGeneration = mScanFusion.getSessionId();\n"
-              "            mScanActive = true;\n"
-              "        }\n"
-              "    }\n\n"
-              "    public void stopScan() { mScanActive = false; }\n"
-              "    public boolean isScanActive() { return mScanActive; }\n"
-              "    public int getScanPointCount() { return mScanFusion.getPointCount(); }\n"
-              "    public boolean isScanTracking() { return mScanFusion.isTracking(); }\n"
-              "    public void writeScan(File file) throws IOException { mScanFusion.writePly(file); }\n\n"
-              "    public void showPointcloud(boolean showPoints) {",
-              "GLRenderer scan public API")
-          close_anchor = "        if (mYuyDecoder != null) mYuyDecoder.close();"
-          if close_anchor in renderer:
-              renderer = renderer.replace(close_anchor,
-                  close_anchor + "\n        mFusionExecutor.shutdown();", 1)
-          renderer_file.write_text(renderer)
-
-          # 4) Expose the scan API through the existing RealSense SurfaceView.
-          surface = rs_surface_file.read_text()
-          surface = replace_once(surface,
-              "import java.util.Map;",
-              "import java.util.Map;\nimport java.io.File;\nimport java.io.IOException;",
-              "GLRsSurfaceView IO imports")
-          surface = replace_once(surface,
-              "    public void showPointcloud(boolean showPoints) {\n        mRenderer.showPointcloud(showPoints);\n    }",
-              "    public void showPointcloud(boolean showPoints) {\n        mRenderer.showPointcloud(showPoints);\n    }\n\n"
-              "    public void startScan() { mRenderer.startScan(); }\n"
-              "    public void stopScan() { mRenderer.stopScan(); }\n"
-              "    public boolean isScanActive() { return mRenderer.isScanActive(); }\n"
-              "    public int getScanPointCount() { return mRenderer.getScanPointCount(); }\n"
-              "    public boolean isScanTracking() { return mRenderer.isScanTracking(); }\n"
-              "    public void writeScan(File file) throws IOException { mRenderer.writeScan(file); }",
-              "GLRsSurfaceView scan API")
-          rs_surface_file.write_text(surface)
-
-          # 5) Add Scan/Stop controls and a live tracking/point-count indicator to PreviewActivity.
-          activity = activity_file.read_text()
-          activity = replace_once(activity,
-              "        m3dButton.setOnClickListener(new View.OnClickListener() {\n"
-              "            @Override\n"
-              "            public void onClick(View view) {\n"
-              "                mGLSurfaceView.setVisibility(View.GONE);",
-              "        m3dButton.setOnClickListener(new View.OnClickListener() {\n"
-              "            @Override\n"
-              "            public void onClick(View view) {\n"
-              "                if (mScanActive) {\n"
-              "                    Toast.makeText(PreviewActivity.this, \"3D-режим закреплён на время сканирования\", Toast.LENGTH_SHORT).show();\n"
-              "                    return;\n"
-              "                }\n"
-              "                mGLSurfaceView.setVisibility(View.GONE);",
-              "Disable 3D toggle during scan")
-          activity = replace_once(activity,
-              "    private TextView mExportPlyButton;",
-              "    private TextView mExportPlyButton;\n"
-              "    private TextView mScanButton;\n"
-              "    private TextView mScanStatus;\n"
-              "    private boolean mScanActive = false;",
-              "PreviewActivity scan fields")
-          activity = replace_once(activity,
-              "        mExportPlyButton = findViewById(R.id.preview_export_ply_button);",
-              "        mExportPlyButton = findViewById(R.id.preview_export_ply_button);\n"
-              "        mScanButton = findViewById(R.id.preview_scan_button);\n"
-              "        mScanStatus = findViewById(R.id.preview_scan_status);\n"
-              "        mScanButton.setText(mScanActive ? \"STOP\" : \"SCAN\");\n"
-              "        mScanStatus.setVisibility(mScanActive ? View.VISIBLE : View.GONE);",
-              "PreviewActivity scan view binding")
-          activity = replace_once(activity,
-              "        mExportPlyButton.setOnClickListener(new View.OnClickListener() {",
-              "        mScanButton.setOnClickListener(new View.OnClickListener() {\n"
-              "            @Override\n"
-              "            public void onClick(View view) {\n"
-              "                if (!mScanActive) {\n"
-              "                    mGLSurfaceView.clear();\n"
-              "                    mGLSurfaceView.showPointcloud(true);\n"
-              "                    mGLSurfaceView.startScan();\n"
-              "                    mScanActive = true;\n"
-              "                    mShow3D = true;\n"
-              "                    m3dButton.setTextColor(Color.YELLOW);\n"
-              "                    SharedPreferences prefs = getSharedPreferences(getString(R.string.app_settings), Context.MODE_PRIVATE);\n"
-              "                    prefs.edit().putBoolean(getString(R.string.show_3d), true).apply();\n"
-              "                    mScanButton.setText(\"STOP\");\n"
-              "                    mScanStatus.setVisibility(View.VISIBLE);\n"
-              "                    mScanStatus.setText(\"Сканирование: поиск геометрии...\");\n"
-              "                } else {\n"
-              "                    mGLSurfaceView.stopScan();\n"
-              "                    mScanActive = false;\n"
-              "                    mScanButton.setText(\"SCAN\");\n"
-              "                    mScanStatus.setText(\"Остановлено · \" + mGLSurfaceView.getScanPointCount() + \" точек\");\n"
-              "                }\n"
-              "            }\n"
-              "        });\n\n"
-              "        mExportPlyButton.setOnClickListener(new View.OnClickListener() {",
-              "PreviewActivity scan click listener")
-          # Replace existing snapshot-only button handler with a dual fused-map / one-frame exporter.
-          start = activity.index("        mExportPlyButton.setOnClickListener(new View.OnClickListener() {")
-          end = activity.index("        mStatisticsButton.setOnClickListener(new View.OnClickListener() {", start)
-          export_listener = '''        mExportPlyButton.setOnClickListener(new View.OnClickListener() {
-                      @Override
-                      public void onClick(View view) {
-                          if (!mPlyExportState.compareAndSet(0, 2)) {
-                              Toast.makeText(PreviewActivity.this, "Экспорт уже выполняется", Toast.LENGTH_SHORT).show();
-                              return;
-                          }
-                          final boolean exportFused = mGLSurfaceView.getScanPointCount() > 0;
-                          if (!exportFused && mScanActive) {
-                              mPlyExportState.set(0);
-                              Toast.makeText(PreviewActivity.this,
-                                      "Дождитесь регистрации первых кадров сканирования", Toast.LENGTH_LONG).show();
-                              return;
-                          }
-                          if (!exportFused) mPlyExportState.set(1);
-                          if (exportFused) {
-                              Toast.makeText(PreviewActivity.this, "Сохраняю объединённое облако...", Toast.LENGTH_SHORT).show();
-                              try {
-                                  mPlyExportExecutor.execute(() -> {
-                                      try {
-                                          final String savedLocation = PlySnapshotExporter.exportCloud(
-                                                  PreviewActivity.this, mGLSurfaceView);
-                                          runOnUiThread(() -> Toast.makeText(PreviewActivity.this,
-                                                  "Скан сохранён: " + savedLocation, Toast.LENGTH_LONG).show());
-                                      } catch (Exception e) {
-                                          Log.e(TAG, "Fused PLY export failed", e);
-                                          final String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-                                          runOnUiThread(() -> Toast.makeText(PreviewActivity.this,
-                                                  "Ошибка сохранения: " + message, Toast.LENGTH_LONG).show());
-                                      } finally {
-                                          mPlyExportState.set(0);
-                                      }
-                                  });
-                              } catch (RejectedExecutionException e) {
-                                  mPlyExportState.set(0);
-                                  Log.e(TAG, "PLY export executor rejected the task", e);
-                              }
-                          } else {
-                              mPlyExportState.set(1);
-                              Toast.makeText(PreviewActivity.this,
-                                      "Сохраню облако точек со следующего кадра", Toast.LENGTH_SHORT).show();
-                          }
-                      }
-                  });
-
-          '''
-          activity = activity[:start] + export_listener + activity[end:]
-          activity = replace_once(activity,
-              "                mStreamingStats.onFrameset(frameSet);",
-              "                mStreamingStats.onFrameset(frameSet);\n"
-              "                if (mScanActive && mScanStatus != null) {\n"
-              "                    int count = mGLSurfaceView.getScanPointCount();\n"
-              "                    String tracking = mGLSurfaceView.isScanTracking() ? \"tracking OK\" : \"поиск совпадений\";\n"
-              "                    mScanStatus.setText(\"СКАН · \" + count + \" точек · \" + tracking);\n"
-              "                }",
-              "PreviewActivity live scan status")
-          activity_file.write_text(activity)
-
-          # 6) Add a scan HUD to the existing preview layout.
-          layout = layout_file.read_text()
-          layout = replace_once(layout,
-              '    <ScrollView\n',
-              '    <LinearLayout\n'
-              '        android:layout_width="match_parent"\n'
-              '        android:layout_height="wrap_content"\n'
-              '        android:layout_alignParentTop="true"\n'
-              '        android:orientation="horizontal"\n'
-              '        android:gravity="center_vertical"\n'
-              '        android:padding="12dp"\n'
-              '        android:background="#99000000">\n\n'
-              '        <TextView\n'
-              '            android:id="@+id/preview_scan_button"\n'
-              '            android:layout_width="wrap_content"\n'
-              '            android:layout_height="wrap_content"\n'
-              '            android:padding="10dp"\n'
-              '            android:clickable="true"\n'
-              '            android:focusable="true"\n'
-              '            android:text="SCAN"\n'
-              '            android:textColor="#ffffff"\n'
-              '            android:textStyle="bold"\n'
-              '            android:background="#444444" />\n\n'
-              '        <TextView\n'
-              '            android:id="@+id/preview_scan_status"\n'
-              '            android:layout_width="0dp"\n'
-              '            android:layout_height="wrap_content"\n'
-              '            android:layout_weight="1"\n'
-              '            android:paddingStart="12dp"\n'
-              '            android:text="Сканирование не запущено"\n'
-              '            android:textColor="#ffffff"\n'
-              '            android:textSize="12sp"\n'
-              '            android:visibility="gone" />\n'
-              '    </LinearLayout>\n\n'
-              '    <ScrollView\n',
-              "Preview scan HUD layout")
-          layout_file.write_text(layout)
-
-          # 7) Make the existing PLY button export the fused map when one exists.
-          exporter = exporter_file.read_text()
-          exporter = replace_once(exporter,
-              "import com.intel.realsense.librealsense.Extension;",
-              "import com.intel.realsense.librealsense.Extension;\n"
-              "import com.intel.realsense.librealsense.GLRsSurfaceView;",
-              "PLY exporter surface import")
-          exporter = replace_once(exporter,
-              "    private PlySnapshotExporter() { }",
-              "    private PlySnapshotExporter() { }\n\n"
-              "    public static String exportCloud(Context context, GLRsSurfaceView view) throws Exception {\n"
-              "        File documents = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);\n"
-              "        if (documents == null) throw new IOException(\"External app storage is unavailable\");\n"
-              "        File outputDir = new File(documents, \"RealSense3D\");\n"
-              "        if (!outputDir.exists() && !outputDir.mkdirs()) throw new IOException(\"Cannot create scan output directory\");\n"
-              "        String stamp = new SimpleDateFormat(\"yyyyMMdd_HHmmss_SSS\", Locale.US).format(new Date());\n"
-              "        File output = new File(outputDir, \"fused_scan_\" + stamp + \".ply\");\n"
-              "        view.writeScan(output);\n"
-              "        if (!output.isFile() || output.length() == 0) throw new IOException(\"Fused PLY file is empty\");\n"
-              "        return publishToDownloads(context, output);\n"
-              "    }",
-              "PLY exporter fused cloud method")
-          exporter = replace_once(exporter,
-              "    private static String publishToDownloads(Context context, File source) throws Exception {",
-              "    public static String publishToDownloads(Context context, File source) throws Exception {",
-              "PLY exporter publish visibility")
-          exporter_file.write_text(exporter)
-
-          # Bump the app version so Android treats this as the next scanner release.
-          app_gradle = app_gradle_file.read_text()
-          app_gradle = replace_once(app_gradle, "        versionCode 6", "        versionCode 7", "app version code")
-          app_gradle = replace_once(app_gradle, '        versionName "0.0.6"', '        versionName "0.0.7"', "app version name")
-          app_gradle_file.write_text(app_gradle)
-
-          print("Live point-cloud scan fusion patch applied")
-          PY
-
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -1328,16 +347,24 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Build RealSense 3D Studio
-        working-directory: source/wrappers/android
+      - name: Test native ICP and voxel fusion
         shell: bash
         run: |
-          gradle :tools:camera:assembleDebug --no-daemon --stacktrace
+          g++ -std=c++17 -O2 -Wall -Wextra \
+            source/wrappers/android/tools/scanner/tests/scan_fusion_host_test.cpp \
+            source/wrappers/android/tools/scanner/app/src/main/cpp/scan_fusion_core.cpp \
+            -o /tmp/scan_fusion_host_test
+          /tmp/scan_fusion_host_test
 
-      - name: Upload APK
+      - name: Build standalone Android scanner
+        working-directory: source/wrappers/android
+        shell: bash
+        run: gradle :tools:scanner:app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload scanner APK
         uses: actions/upload-artifact@v4
         with:
-          name: RealSense-3D-Studio-APK
-          path: source/wrappers/android/tools/camera/build/outputs/apk/debug/*.apk
+          name: RealSense-3D-Scanner-APK
+          path: source/wrappers/android/tools/scanner/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
