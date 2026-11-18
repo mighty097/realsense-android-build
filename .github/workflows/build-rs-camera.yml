@@ -312,6 +312,23 @@ jobs:
           shutil.copytree(bundle / "app", module / "app", dirs_exist_ok=True)
           shutil.copytree(bundle / "tests", module / "tests", dirs_exist_ok=True)
 
+          # The librealsense library manifest declares android:allowBackup=true.
+          # Explicitly keep the standalone scanner's false value during manifest merge.
+          manifest = module / "app/src/main/AndroidManifest.xml"
+          manifest_text = manifest.read_text()
+          root_tag = '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+          root_tag_fixed = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n          xmlns:tools="http://schemas.android.com/tools">'
+          if manifest_text.count(root_tag) != 1:
+              raise SystemExit("Could not find the expected scanner manifest root tag")
+          manifest_text = manifest_text.replace(root_tag, root_tag_fixed, 1)
+          app_tag = '<application\n        android:allowBackup="false"'
+          app_tag_fixed = '<application\n        android:allowBackup="false"\n        tools:replace="android:allowBackup"'
+          if manifest_text.count(app_tag) != 1:
+              raise SystemExit("Could not find the expected application allowBackup attribute")
+          manifest_text = manifest_text.replace(app_tag, app_tag_fixed, 1)
+          manifest.write_text(manifest_text)
+          print("Resolved app/library manifest allowBackup conflict")
+
           settings = Path("source/wrappers/android/settings.gradle")
           text = settings.read_text()
           include = "include ':tools:scanner:app'"
